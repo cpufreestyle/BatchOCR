@@ -1,0 +1,820 @@
+//
+//  BatchOCR — 批量 PDF OCR（GUI + CLI 双模式）
+//
+//  以开源 OCRmyPDF（MPL-2.0）+ Tesseract（Apache-2.0）为识别引擎，
+//  在其上补齐付费软件（Nitro PDF Pro / ABBYY FineReader）才有的
+//  Mac 批量图形界面：拖拽入列、参数配置、进度展示、结果校验。
+//
+
+import AppKit
+import PDFKit
+import CoreText
+import UniformTypeIdentifiers
+
+// MARK: - 设置
+
+struct OCRSettings {
+    enum Mode: Int, CaseIterable {
+        case skipText = 0   // 跳过已有文字层的页面（安全默认）
+        case redoOcr  = 1   // 重做已有文字层
+        case forceOcr = 2   // 强制整页栅格化后重新识别
+
+        var flag: String {
+            switch self {
+            case .skipText: return "--skip-text"
+            case .redoOcr:  return "--redo-ocr"
+            case .forceOcr: return "--force-ocr"
+            }
+        }
+        var label: String {
+            switch self {
+            case .skipText: return "跳过已有文字层（推荐）"
+            case .redoOcr:  return "重做已有文字层"
+            case .forceOcr: return "强制整页重新识别"
+            }
+        }
+    }
+
+    var languages = "eng"
+    var mode: Mode = .skipText
+    var deskew = false
+    var clean = false
+    var rotatePages = false
+    var pdfa = false
+    var jobs = max(1, min(8, ProcessInfo.processInfo.activeProcessorCount))
+    var outputDir: URL?
+}
+
+// MARK: - 引擎定位
+
+enum Engine {
+    static func locate(_ name: String) -> String? {
+        let env = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/opt/homebrew/bin"
+        for dir in env.split(separator: ":") {
+            let full = (String(dir) as NSString).appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: full) { return full }
+        }
+        for fixed in ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        where FileManager.default.isExecutableFile(atPath: fixed) { return fixed }
+        return nil
+    }
+
+    static var ocrmypdfPath: String? { locate("ocrmypdf") }
+    static var tesseractPath: String? { locate("tesseract") }
+
+    static func unavailableReason() -> String? {
+        if ocrmypdfPath == nil { return "未找到 ocrmypdf 引擎。请先运行：brew install ocrmypdf" }
+        if tesseractPath == nil { return "未找到 tesseract。请先运行：brew install ocrmypdf" }
+        return nil
+    }
+
+    static func installedLanguages() -> [String] {
+        guard let bin = tesseractPath else { return [] }
+        let out = runCommand(bin, ["--list-langs"])
+        return out.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("List of") && $0 != "osd" }
+            .sorted()
+    }
+
+    static func runCommand(_ exe: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+// MARK: - PDF 检查（页数 / 文字层）
+
+enum PDFCheck {
+    static func info(_ url: URL) -> (pages: Int, chars: Int, sample: String) {
+        guard let doc = PDFDocument(url: url) else { return (0, 0, "") }
+        let s = doc.string ?? ""
+        let sample = String(s.prefix(80))
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return (doc.pageCount, s.count, sample)
+    }
+
+    static func fileSize(_ url: URL) -> Int64 {
+        let d = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (d?[.size] as? NSNumber)?.int64Value ?? 0
+    }
+}
+
+// MARK: - 识别结果
+
+struct OCRResult {
+    var ok: Bool
+    var inputURL: URL
+    var outputURL: URL?
+    var outputBytes: Int64
+    var pages: Int
+    var chars: Int
+    var message: String
+}
+
+// MARK: - OCR 执行（调用开源引擎）
+
+enum OCRRunner {
+    static let imageExts = ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]
+    static let acceptedExts = ["pdf"] + imageExts
+
+    static func resolveOutput(for input: URL, settings: OCRSettings) -> URL {
+        let base = input.deletingPathExtension().lastPathComponent
+        let dir = settings.outputDir ?? input.deletingLastPathComponent()
+        var candidate = dir.appendingPathComponent(base + "_ocr.pdf")
+        var n = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = dir.appendingPathComponent("\(base)_ocr_\(n).pdf")
+            n += 1
+        }
+        return candidate
+    }
+
+    static func convertImageToPDF(_ img: URL) -> URL? {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".pdf")
+        guard let sips = Engine.locate("sips") else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: sips)
+        p.arguments = ["-s", "format", "pdf", img.path, "--out", tmp.path]
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        return p.terminationStatus == 0 ? tmp : nil
+    }
+
+    static func ocrOne(input original: URL, settings: OCRSettings) -> OCRResult {
+        func fail(_ msg: String) -> OCRResult {
+            OCRResult(ok: false, inputURL: original, outputURL: nil,
+                      outputBytes: 0, pages: 0, chars: 0, message: msg)
+        }
+        guard let bin = Engine.ocrmypdfPath else {
+            return fail("找不到 ocrmypdf，请先运行 brew install ocrmypdf")
+        }
+
+        var input = original
+        let ext = original.pathExtension.lowercased()
+        if imageExts.contains(ext) {
+            guard let tmp = convertImageToPDF(original) else { return fail("图片转 PDF 失败") }
+            input = tmp
+        }
+
+        let output = resolveOutput(for: original, settings: settings)
+        var args = [settings.mode.flag,
+                    "--language", settings.languages,
+                    "--jobs", String(settings.jobs),
+                    "--output-type", settings.pdfa ? "pdfa" : "pdf"]
+        if settings.deskew { args.append("--deskew") }
+        if settings.clean { args.append("--clean") }
+        if settings.rotatePages { args.append("--rotate-pages") }
+        args += [input.path, output.path]
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return fail("无法启动 ocrmypdf：\(error.localizedDescription)") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+
+        if p.terminationStatus != 0 {
+            let logText = String(data: data, encoding: .utf8) ?? ""
+            let tail = logText.split(separator: "\n").suffix(4).joined(separator: " | ")
+            return fail("ocrmypdf 退出码 \(p.terminationStatus)：\(String(tail.prefix(240)))")
+        }
+
+        let info = PDFCheck.info(output)
+        guard info.pages > 0 else { return fail("输出文件无法解析") }
+        return OCRResult(ok: true, inputURL: original, outputURL: output,
+                         outputBytes: PDFCheck.fileSize(output),
+                         pages: info.pages, chars: info.chars,
+                         message: info.sample)
+    }
+}
+
+// MARK: - 队列条目
+
+struct DocItem {
+    enum Status: String {
+        case pending = "待处理", checking = "分析中…", running = "识别中…"
+        case done = "完成", failed = "失败"
+    }
+    let url: URL
+    var status: Status = .pending
+    var pages = 0
+    var hasTextLayer = false
+    var resultURL: URL?
+    var resultBytes: Int64 = 0
+    var textChars = 0
+    var note = ""
+}
+
+// MARK: - CLI 模式（供脚本化验证与命令行使用）
+
+func runCLI(_ args: [String]) -> Int32 {
+    let usage = """
+    用法: BatchOCR --cli [选项] <文件.pdf|目录> ...
+      --lang chi_sim+eng   识别语言，用 + 连接（默认 eng）
+      --mode skip|redo|force   skip=跳过已有文字层, redo=重做, force=强制整页
+      --deskew --clean --rotate   纠偏 / 去噪 / 自动旋转
+      --pdfa               输出 PDF/A
+      --jobs N             并行页数（默认 CPU 数）
+      --out DIR            输出目录（默认：源目录 + _ocr 后缀）
+    每行输出: [OK|FAIL]\\t文件\\t详情
+    """
+    var s = OCRSettings()
+    var inputs: [String] = []
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        func next(_ name: String) -> String? {
+            guard i + 1 < args.count else {
+                fputs("缺少 \(name) 的值\n", stderr); exit(2)
+            }
+            i += 1
+            return args[i]
+        }
+        switch a {
+        case "--lang": s.languages = next("--lang") ?? "eng"
+        case "--mode":
+            switch next("--mode") ?? "skip" {
+            case "redo": s.mode = .redoOcr
+            case "force": s.mode = .forceOcr
+            default: s.mode = .skipText
+            }
+        case "--jobs": s.jobs = Int(next("--jobs") ?? "") ?? s.jobs
+        case "--out": s.outputDir = URL(fileURLWithPath: next("--out") ?? ".").resolvingSymlinksInPath()
+        case "--deskew": s.deskew = true
+        case "--clean": s.clean = true
+        case "--rotate": s.rotatePages = true
+        case "--pdfa": s.pdfa = true
+        case "--help", "-h": print(usage); return 0
+        default:
+            if a.hasPrefix("-") { fputs("未知参数：\(a)\n\(usage)\n", stderr); return 2 }
+            inputs.append((a as NSString).expandingTildeInPath)
+        }
+        i += 1
+    }
+
+    var files: [URL] = []
+    for p in inputs {
+        var isDir: ObjCBool = false
+        let path = p
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else {
+            fputs("不存在：\(path)\n", stderr); return 2
+        }
+        if isDir.boolValue {
+            let items = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+            files += items
+                .filter { (URL(fileURLWithPath: $0).pathExtension.lowercased()) == "pdf" }
+                .sorted().map { URL(fileURLWithPath: path).appendingPathComponent($0) }
+        } else {
+            files.append(URL(fileURLWithPath: path))
+        }
+    }
+    guard !files.isEmpty else { print(usage); return 2 }
+
+    if let reason = Engine.unavailableReason() {
+        fputs("\(reason)\n", stderr); return 2
+    }
+    if let dir = s.outputDir {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    var okCount = 0, failCount = 0
+    for f in files {
+        fputs("→ \(f.lastPathComponent)\n", stderr)
+        let r = OCRRunner.ocrOne(input: f, settings: s)
+        if r.ok {
+            okCount += 1
+            print("[OK]\t\(f.lastPathComponent)\t\(r.outputURL?.path ?? "-")\tpages=\(r.pages)\tchars=\(r.chars)")
+        } else {
+            failCount += 1
+            print("[FAIL]\t\(f.lastPathComponent)\t\(r.message.replacingOccurrences(of: "\t", with: " "))")
+        }
+    }
+    fputs("batchocr：\(okCount) 成功，\(failCount) 失败\n", stderr)
+    return failCount == 0 ? 0 : 1
+}
+
+// MARK: - GUI
+
+final class DropView: NSView {
+    var onFiles: (([URL]) -> Void)?
+    var onLayout: (() -> Void)?
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        onLayout?()
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return files(from: sender) != nil ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = files(from: sender) else { return false }
+        onFiles?(urls)
+        return true
+    }
+
+    private func files(from sender: NSDraggingInfo) -> [URL]? {
+        guard let urls = sender.draggingPasteboard
+            .readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else { return nil }
+        let accepted = urls.filter {
+            $0.isFileURL && OCRRunner.acceptedExts.contains($0.pathExtension.lowercased())
+        }
+        return accepted.isEmpty ? nil : accepted
+    }
+}
+
+final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    var window: NSWindow!
+    private var items: [DocItem] = []
+    private var isRunning = false
+    private var settings = OCRSettings()
+    private var lastOutputDir: URL?
+
+    private let tableView = NSTableView()
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let engineLabel = NSTextField(labelWithString: "")
+    private var startButton: NSButton!
+    private var addButton: NSButton!
+    private var addFolderButton: NSButton!
+    private var removeButton: NSButton!
+    private var clearButton: NSButton!
+    private var langCombo: NSComboBox!
+    private var modePopup: NSPopUpButton!
+    private var deskewCheck: NSButton!
+    private var cleanCheck: NSButton!
+    private var rotateCheck: NSButton!
+    private var pdfaCheck: NSButton!
+    private var jobsStepper: NSStepper!
+    private var jobsLabel: NSTextField!
+    private var outputPopup: NSPopUpButton!
+    private var openFolderButton: NSButton!
+    private var hintLabel: NSTextField!
+    private var langTitle: NSTextField!
+    private var modeTitle: NSTextField!
+    private var outTitle: NSTextField!
+    private let scroll = NSScrollView()
+
+    private var outputDirURL: URL?
+
+    // MARK: 窗口与布局
+
+    func buildWindow() {
+        let content = DropView(frame: NSRect(x: 0, y: 0, width: 820, height: 640))
+        content.registerForDraggedTypes([.fileURL])
+        content.onFiles = { [weak self] in self?.addURLs($0) }
+        content.onLayout = { [weak self] in self?.layoutContent() }
+
+        hintLabel = NSTextField(labelWithString:
+            "把 PDF（或图片）拖到这里 — 批量 OCR 生成可搜索 PDF · 引擎：OCRmyPDF + Tesseract（开源）")
+        hintLabel.font = .systemFont(ofSize: 12)
+        hintLabel.textColor = .secondaryLabelColor
+
+        // 表格
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let ids: [(String, String, CGFloat)] = [
+            ("name", "文件名", 250), ("pages", "页数", 52), ("orig", "原大小", 78),
+            ("result", "结果大小", 84), ("status", "状态", 260),
+        ]
+        for (id, title, w) in ids {
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            col.title = title
+            col.width = w
+            col.minWidth = 40
+            tableView.addTableColumn(col)
+        }
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.rowHeight = 26
+        tableView.allowsMultipleSelection = true
+        tableView.usesAlternatingRowBackgroundColors = true
+        scroll.documentView = tableView
+
+        // 按钮行
+        addButton = button("添加 PDF…", #selector(chooseFiles))
+        addFolderButton = button("添加文件夹…", #selector(chooseFolder))
+        removeButton = button("移除所选", #selector(removeSelected))
+        clearButton = button("清空", #selector(clearAll))
+
+        // 选项行 1：语言 / 模式
+        langTitle = label("识别语言：")
+        langCombo = NSComboBox()
+        langCombo.completes = true
+        let langs = Engine.installedLanguages()
+        langCombo.removeAllItems()
+        langCombo.addItems(withObjectValues: langs)
+        langCombo.stringValue = langs.contains("chi_sim") ? "chi_sim+eng" : "eng"
+
+        modeTitle = label("模式：")
+        modePopup = NSPopUpButton()
+        modePopup.addItems(withTitles: OCRSettings.Mode.allCases.map(\.label))
+        modePopup.selectItem(at: 0)
+
+        // 选项行 2：开关 / 并行
+        deskewCheck = check("自动纠偏")
+        cleanCheck = check("去噪")
+        rotateCheck = check("自动旋转")
+        pdfaCheck = check("输出 PDF/A")
+        jobsStepper = NSStepper()
+        jobsStepper.minValue = 1
+        jobsStepper.maxValue = 16
+        jobsStepper.doubleValue = Double(settings.jobs)
+        jobsStepper.target = self
+        jobsStepper.action = #selector(stepperChanged)
+        jobsLabel = label("并行 \(settings.jobs)")
+
+        // 选项行 3：输出
+        outTitle = label("输出：")
+        outputPopup = NSPopUpButton()
+        outputPopup.addItems(withTitles: ["输出到原目录（加 _ocr 后缀）", "输出到指定文件夹…"])
+        outputPopup.target = self
+        outputPopup.action = #selector(outputChanged)
+
+        // 底部
+        startButton = button("开始 OCR", #selector(startOCR))
+        startButton.keyEquivalent = "\r"
+        openFolderButton = button("打开输出文件夹", #selector(openFolder))
+        statusLabel.alignment = .right
+
+        engineLabel.font = .systemFont(ofSize: 10.5)
+        engineLabel.textColor = .tertiaryLabelColor
+        engineLabel.stringValue = "引擎：\(Engine.ocrmypdfPath ?? "未找到 ocrmypdf") · 语言包：\(langs.isEmpty ? "未知" : langs.joined(separator: " "))"
+
+        for v: NSView in [hintLabel, scroll, addButton, addFolderButton, removeButton, clearButton,
+                          langTitle, langCombo, modeTitle, modePopup,
+                          deskewCheck, cleanCheck, rotateCheck, pdfaCheck, jobsStepper, jobsLabel,
+                          outTitle, outputPopup,
+                          startButton, openFolderButton, statusLabel, engineLabel] {
+            content.addSubview(v)
+        }
+
+        let win = NSWindow(contentRect: content.bounds,
+                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                           backing: .buffered, defer: false)
+        win.title = "BatchOCR — 批量 PDF OCR（基于开源 OCRmyPDF）"
+        win.contentView = content
+        win.center()
+        win.minSize = NSSize(width: 760, height: 600)
+        window = win
+        layoutContent()
+        refreshControls()
+        updateStatus()
+    }
+
+    /// 手动确定性布局（flipped 坐标，自上而下）
+    func layoutContent() {
+        guard let cv = window?.contentView else { return }
+        let w = cv.bounds.width, h = cv.bounds.height
+        hintLabel.frame = NSRect(x: 14, y: 10, width: w - 28, height: 18)
+        let scrollH = max(140, h - 410)
+        scroll.frame = NSRect(x: 14, y: 36, width: w - 28, height: scrollH)
+        var y = 36 + scrollH + 12
+        addButton.frame = NSRect(x: 14, y: y, width: 108, height: 26)
+        addFolderButton.frame = NSRect(x: 130, y: y, width: 124, height: 26)
+        removeButton.frame = NSRect(x: 262, y: y, width: 92, height: 26)
+        clearButton.frame = NSRect(x: 362, y: y, width: 64, height: 26)
+        y += 38
+        langTitle.frame = NSRect(x: 14, y: y + 5, width: 68, height: 18)
+        langCombo.frame = NSRect(x: 86, y: y, width: 190, height: 28)
+        modeTitle.frame = NSRect(x: 294, y: y + 5, width: 42, height: 18)
+        modePopup.frame = NSRect(x: 340, y: y, width: 214, height: 28)
+        y += 40
+        deskewCheck.frame = NSRect(x: 14, y: y + 2, width: 88, height: 22)
+        cleanCheck.frame = NSRect(x: 108, y: y + 2, width: 62, height: 22)
+        rotateCheck.frame = NSRect(x: 176, y: y + 2, width: 88, height: 22)
+        pdfaCheck.frame = NSRect(x: 270, y: y + 2, width: 104, height: 22)
+        jobsStepper.frame = NSRect(x: 388, y: y, width: 44, height: 26)
+        jobsLabel.frame = NSRect(x: 438, y: y + 4, width: 62, height: 18)
+        y += 38
+        outTitle.frame = NSRect(x: 14, y: y + 5, width: 44, height: 18)
+        outputPopup.frame = NSRect(x: 62, y: y, width: 264, height: 28)
+        y += 42
+        startButton.frame = NSRect(x: 14, y: y, width: 112, height: 32)
+        openFolderButton.frame = NSRect(x: 134, y: y + 2, width: 136, height: 28)
+        statusLabel.frame = NSRect(x: w - 334, y: y + 7, width: 320, height: 18)
+        engineLabel.frame = NSRect(x: 14, y: y + 46, width: w - 28, height: 15)
+    }
+
+    private func label(_ t: String) -> NSTextField { NSTextField(labelWithString: t) }
+    private func check(_ t: String) -> NSButton { NSButton(checkboxWithTitle: t, target: self, action: nil) }
+
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        return b
+    }
+
+    // MARK: 条目管理
+
+    @objc private func chooseFiles() {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = false
+        p.allowedContentTypes = [.pdf, .png, .jpeg, .tiff]
+        guard p.runModal() == .OK else { return }
+        addURLs(p.urls)
+    }
+
+    @objc private func chooseFolder() {
+        let p = NSOpenPanel()
+        p.canChooseDirectories = true
+        p.canChooseFiles = false
+        guard p.runModal() == .OK, let dir = p.url else { return }
+        let items = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let urls = items
+            .filter { OCRRunner.acceptedExts.contains(URL(fileURLWithPath: $0).pathExtension.lowercased()) }
+            .sorted().map { dir.appendingPathComponent($0) }
+        addURLs(urls)
+    }
+
+    @objc private func removeSelected() {
+        guard !isRunning else { return }
+        let idx = tableView.selectedRowIndexes
+        guard !idx.isEmpty else { return }
+        items.remove(atOffsets: IndexSet(idx))
+        reload()
+        updateStatus()
+    }
+
+    @objc private func clearAll() {
+        guard !isRunning else { return }
+        items.removeAll()
+        reload()
+        updateStatus()
+    }
+
+    func addURLs(_ urls: [URL]) {
+        guard !isRunning else { return }
+        var added = false
+        for u in urls {
+            let path = u.resolvingSymlinksInPath().path
+            guard !items.contains(where: { $0.url.path == path }) else { continue }
+            items.append(DocItem(url: URL(fileURLWithPath: path)))
+            added = true
+        }
+        if added {
+            reload()
+            updateStatus()
+            // 后台预分析页数 / 文字层
+            let snapshot = items
+            DispatchQueue.global().async {
+                for (i, item) in snapshot.enumerated() where item.status == .pending {
+                    let info = PDFCheck.info(item.url)
+                    DispatchQueue.main.async {
+                        guard i < self.items.count, self.items[i].url == item.url,
+                              self.items[i].status == .pending else { return }
+                        self.items[i].pages = info.pages
+                        self.items[i].hasTextLayer = info.chars > 50
+                        self.tableView.reloadData(forRowIndexes: IndexSet([i]),
+                                                  columnIndexes: IndexSet(integersIn: 0..<5))
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: 选项
+
+    @objc private func stepperChanged() {
+        settings.jobs = Int(jobsStepper.doubleValue)
+        jobsLabel.stringValue = "并行 \(settings.jobs)"
+    }
+
+    @objc private func outputChanged() {
+        if outputPopup.indexOfSelectedItem == 1 {
+            let p = NSOpenPanel()
+            p.canChooseDirectories = true
+            p.canChooseFiles = false
+            p.message = "OCR 结果将写入该文件夹"
+            if p.runModal() == .OK, let dir = p.url {
+                outputDirURL = dir
+                outputPopup.item(at: 1)?.title = "输出：\(dir.lastPathComponent)/"
+            } else {
+                outputPopup.selectItem(at: 0)
+                outputDirURL = nil
+            }
+        } else {
+            outputDirURL = nil
+        }
+    }
+
+    private func collectSettings() {
+        settings.languages = langCombo.stringValue.isEmpty ? "eng" : langCombo.stringValue
+        settings.mode = OCRSettings.Mode(rawValue: modePopup.indexOfSelectedItem) ?? .skipText
+        settings.deskew = deskewCheck.state == .on
+        settings.clean = cleanCheck.state == .on
+        settings.rotatePages = rotateCheck.state == .on
+        settings.pdfa = pdfaCheck.state == .on
+        settings.outputDir = outputDirURL
+    }
+
+    // MARK: 执行
+
+    @objc private func startOCR() {
+        guard !isRunning, !items.isEmpty else { NSSound.beep(); return }
+        if let reason = Engine.unavailableReason() { alert(reason); return }
+        collectSettings()
+        if let dir = settings.outputDir {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        isRunning = true
+        refreshControls()
+
+        let jobs: [(Int, URL)] = items.indices
+            .filter { items[$0].status != .done }
+            .map { ($0, items[$0].url) }
+        let s = settings
+
+        DispatchQueue.global().async {
+            for (idx, url) in jobs {
+                DispatchQueue.main.async {
+                    guard idx < self.items.count, self.items[idx].url == url else { return }
+                    self.items[idx].status = .running
+                    self.tableView.reloadData()
+                }
+                let r = OCRRunner.ocrOne(input: url, settings: s)
+                DispatchQueue.main.async {
+                    guard idx < self.items.count, self.items[idx].url == url else { return }
+                    if r.ok {
+                        self.items[idx].status = .done
+                        self.items[idx].resultURL = r.outputURL
+                        self.items[idx].resultBytes = r.outputBytes
+                        self.items[idx].pages = r.pages
+                        self.items[idx].textChars = r.chars
+                        self.items[idx].note = ""
+                        self.lastOutputDir = r.outputURL?.deletingLastPathComponent()
+                    } else {
+                        self.items[idx].status = .failed
+                        self.items[idx].note = r.message
+                    }
+                    self.tableView.reloadData()
+                    self.updateStatus()
+                }
+            }
+            DispatchQueue.main.async {
+                self.isRunning = false
+                self.refreshControls()
+                self.updateStatus()
+            }
+        }
+    }
+
+    @objc private func openFolder() {
+        let dir = settings.outputDir ?? lastOutputDir
+        let url = dir ?? URL(fileURLWithPath: NSHomeDirectory())
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.path)
+    }
+
+    // MARK: 状态
+
+    private func refreshControls() {
+        let engineOK = Engine.unavailableReason() == nil
+        startButton.isEnabled = !isRunning && !items.isEmpty && engineOK
+        addButton.isEnabled = !isRunning
+        addFolderButton.isEnabled = !isRunning
+        removeButton.isEnabled = !isRunning && !items.isEmpty
+        clearButton.isEnabled = !isRunning && !items.isEmpty
+        langCombo.isEnabled = !isRunning
+        modePopup.isEnabled = !isRunning
+        deskewCheck.isEnabled = !isRunning
+        cleanCheck.isEnabled = !isRunning
+        rotateCheck.isEnabled = !isRunning
+        pdfaCheck.isEnabled = !isRunning
+        outputPopup.isEnabled = !isRunning
+    }
+
+    private func updateStatus() {
+        let done = items.filter { $0.status == .done }.count
+        let failed = items.filter { $0.status == .failed }.count
+        statusLabel.stringValue = items.isEmpty
+            ? "尚无文件"
+            : "共 \(items.count) 个文件 · 完成 \(done) · 失败 \(failed)"
+        refreshControls()
+    }
+
+    private func reload() {
+        tableView.reloadData()
+        updateStatus()
+    }
+
+    private func alert(_ text: String) {
+        let a = NSAlert()
+        a.messageText = "BatchOCR"
+        a.informativeText = text
+        a.runModal()
+    }
+
+    // MARK: NSTableView
+
+    func numberOfRows(in _: NSTableView) -> Int { items.count }
+
+    func tableView(_ _: NSTableView, objectValueFor column: NSTableColumn?, row: Int) -> Any? {
+        guard row < items.count, let id = column?.identifier.rawValue else { return nil }
+        let it = items[row]
+        switch id {
+        case "name": return it.url.lastPathComponent
+        case "pages": return it.pages > 0 ? "\(it.pages)" : "—"
+        case "orig": return ByteCountFormatter.string(fromByteCount: PDFCheck.fileSize(it.url), countStyle: .file)
+        case "result":
+            return it.resultBytes > 0
+                ? ByteCountFormatter.string(fromByteCount: it.resultBytes, countStyle: .file) : "—"
+        case "status":
+            switch it.status {
+            case .pending:
+                return it.hasTextLayer ? "待处理 · 已有文字层" : "待处理"
+            case .checking, .running:
+                return it.status.rawValue
+            case .done:
+                var text = "完成 ✓ · \(it.textChars) 字符"
+                let orig = PDFCheck.fileSize(it.url)
+                if it.resultBytes > 0, orig > 0 {
+                    let pct = Int((Double(orig - it.resultBytes) / Double(orig)) * 100)
+                    text += pct >= 0 ? " · 体积 −\(pct)%" : " · 体积 +\(-pct)%"
+                }
+                return text
+            case .failed:
+                return "失败 · \(it.note)"
+            }
+        default: return nil
+        }
+    }
+}
+
+extension Array {
+    mutating func remove(atOffsets offsets: IndexSet) {
+        for i in offsets.sorted(by: >) where i < count { remove(at: i) }
+    }
+}
+
+// MARK: - 入口
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let controller = AppController()
+
+    func applicationDidFinishLaunching(_: Notification) {
+        controller.buildWindow()
+        controller.window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    // 支持 `open -a BatchOCR xxx.pdf` / Finder 拖到 Dock 图标 → 直接入列
+    func application(_ _: NSApplication, openFiles filenames: [String]) {
+        controller.addURLs(filenames.map { URL(fileURLWithPath: $0) })
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool { true }
+}
+
+func buildAppMenu() {
+    let main = NSMenu()
+
+    let appItem = NSMenuItem()
+    main.addItem(appItem)
+    let appMenu = NSMenu()
+    appMenu.addItem(withTitle: "关于 BatchOCR", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+    appMenu.addItem(.separator())
+    appMenu.addItem(withTitle: "退出 BatchOCR", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appItem.submenu = appMenu
+
+    let editItem = NSMenuItem()
+    main.addItem(editItem)
+    let editMenu = NSMenu(title: "编辑")
+    editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editItem.submenu = editMenu
+
+    NSApp.mainMenu = main
+}
+
+let cliArgs = CommandLine.arguments
+if cliArgs.contains("--cli") {
+    let code = runCLI(cliArgs.dropFirst().filter { $0 != "--cli" })
+    exit(code)
+}
+
+let app = NSApplication.shared
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
+app.setActivationPolicy(.regular)
+buildAppMenu()
+app.activate()
+app.run()
