@@ -111,6 +111,7 @@ BatchOCR/
 ├── Sources/main.swift      # 应用主程序（GUI + CLI + 引擎封装）
 ├── tools/sample_tool.swift # 验证工具：生成仿真扫描件 / 检查文字层
 ├── resources/Info.plist
+├── resources/AppIcon.icns  # 应用图标
 ├── LICENSE                 # MIT
 ├── build.sh                # 构建（swiftc，无需 Xcode 工程）
 ├── setup.sh                # 引擎安装与中文语言包补齐

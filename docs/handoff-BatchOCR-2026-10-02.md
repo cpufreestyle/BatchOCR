@@ -87,3 +87,16 @@ git push origin main && git push github main   # 双远端同步
 ## 8. 会话记忆
 
 本项目的立项决策、测试结果、迁移与凭据状态均已存 MemOS（检索关键词：BatchOCR、同步仓库、测试效果）。接手会话可先 `memos search "BatchOCR"`。
+
+## 9. 修复记录（2026-10-02）
+
+针对只读审查发现的问题已全部修复并实测：
+
+- CLI 取值不再吞掉下一个 `--` 选项（`--out --deskew a.pdf` 原先会建出名为 `--deskew` 的目录，现报错退出 2）
+- `--jobs` 与 GUI stepper 统一夹到 `1...16`；`0`/`-3`/`999` 不再透传给引擎
+- `--mode` 未知值改为报错；`--lang` / `--jobs` 缺值与非法整数也会报错
+- 目录输入改为**递归**收集，且同时接受 PDF 与图片，与 GUI 拖入/选文件夹一致
+- `--out` 与输入路径正确展开 `~`
+- `Info.plist` 最低系统版本 12.0 → 14.0（`NSApplication.activate()` 需要 macOS 14），并补充 png/jpeg/tiff 文档类型
+- 新增 `LICENSE`（MIT）与 `resources/AppIcon.icns`（`tools/make_icon.swift` 可复现生成，`build.sh` 自动拷入）
+- README / 本文档数字校正：文字层 445 / 262 / 473，ocrmypdf 17.13.0，双远端 main 已同步

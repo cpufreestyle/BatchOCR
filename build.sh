@@ -12,6 +12,9 @@ swiftc -O -swift-version 5 Sources/main.swift -o "$APP/Contents/MacOS/BatchOCR"
 
 echo "[2/3] 写入 Info.plist 并签名..."
 cp resources/Info.plist "$APP/Contents/Info.plist"
+if [ -f resources/AppIcon.icns ]; then
+  cp resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+fi
 codesign --force -s - "$APP" 2>/dev/null || true
 
 echo "[3/3] 编译验证工具 sample_tool..."
