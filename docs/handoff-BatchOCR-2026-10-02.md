@@ -2,7 +2,7 @@
 
 > 交接日期：2026-10-02
 > 项目位置：`/Users/a1-6/AI Shared/repo/BatchOCR`
-> 仓库：Gitee 与 GitHub 双公开远端，Gitee 为准（HEAD `52cbf1e`；GitHub 落后 1 个 docs 提交，见 §5-2）
+ > 仓库：Gitee 与 GitHub 双公开远端，两端 main 已同步（见 §5-2）
 > - Gitee：https://gitee.com/cpufreestyle/BatchOCR （remote 名 `origin`，**主远端**）
 > - GitHub：https://github.com/cpufreestyle/BatchOCR （remote 名 `github`）
 
@@ -27,7 +27,7 @@
 **核心实测数据**（chi_sim+eng，4 页并行）：
 
 - 英文发票：445 字符，`INVOICE Invoice Number: INV-2026-0930 Total Amount Due: $1,234.56` 近乎完美
-- 中文发票：297 字符，关键词命中；中英混排：500 字符全命中
+ - 中文发票：262 字符，关键词命中；中英混排：473 字符全命中
 - **压测**（页面旋转 2° + 4 万噪点）：不开纠偏 → 大写金额乱码（`ARMS TAGS…`）；`--deskew --clean` → 315 字符关键词全命中，且输出页被自动摆正、去噪（付费软件宣传的"扫描件修复"效果）
 
 ## 3. 结构与关键文件
@@ -49,7 +49,7 @@ BatchOCR/
 
 ## 4. 环境依赖（本机已装好）
 
-- `ocrmypdf 17.12.1`（brew，自动带 tesseract/ghostscript/qpdf）
+ - `ocrmypdf 17.13.0`（brew，自动带 tesseract/ghostscript/qpdf；tesseract 5.5.3）
 - tesseract 语言包 163 种（含 chi_sim/chi_tra/jpn），`/opt/homebrew/share/tessdata/`
 - Xcode 26 / Swift 6.4（构建用 `-swift-version 5` 规避严格并发）
 - 凭据：`~/.git-credentials`（gitee oauth2 token + github PAT `ghp_…LPLTG`，权限 600）
@@ -57,7 +57,7 @@ BatchOCR/
 ## 5. 踩过的坑（重要）
 
 1. **GUI 首次启动不投递文件事件**：`open -a BatchOCR.app 文件.pdf` 在应用第一次启动时 odoc 事件常被 LaunchServices 丢弃；对**运行中**实例重发即可。已写入 README。
-2. **GitHub 网络间歇性阻断**：到 github.com 的 HTTPS 时通时断（可用时握手 ~6 秒；阻断时表现为 75s 连接超时或 `SSL_ERROR_SYSCALL`，连 curl 也会挂起）。代码基线 `96962bb` 已推上 GitHub；交接文档提交 `52cbf1e` 推送时恰逢阻断窗口，**GitHub 暂落后这 1 个提交**，恢复后执行 `git push github main` 即可补齐。**以 Gitee（origin）为主远端**——它始终稳定。另：8888 端口不是 HTTP 代理；SSH 经 SOCKS 1082 不通；gh CLI keyring token 已失效（现在用 ~/.git-credentials 里的 PAT）。
+2. **GitHub 网络间歇性阻断**：到 github.com 的 HTTPS 时通时断（可用时握手 ~6 秒；阻断时表现为 75s 连接超时或 `SSL_ERROR_SYSCALL`，连 curl 也会挂起）。早前 GitHub 一度落后 2 个 docs 提交（卡在 `96962bb`），2026-10-02 网络恢复后已 `git push github main` 补齐，两端 main 一致。仍**以 Gitee（origin）为主远端**——它始终稳定。另：8888 端口不是 HTTP 代理；SSH 经 SOCKS 1082 不通；gh CLI keyring token 已失效（现在用 ~/.git-credentials 里的 PAT）。
 3. **中文 OCR 断言**：Tesseract 会在中文字符间插空格（`发 票`），测试脚本 grep 前必须 `tr -d ' '` 归一化；`inspect` 输出 sample 已扩到 2000 字符。
 4. **`.mimosa/` 工具状态目录**：Mimosa hook 会在仓库内写运行时状态，已在 `.gitignore`（提交 `96962bb`）。若再用 `git add -A` 注意勿重新跟踪。
 5. **Swift 6 编译**：必须 `-swift-version 5`；CGPDF 用 `CGContext(url:mediaBox:)` 新接口；`NSAttributedString.Key` 需 `as String` 转换。

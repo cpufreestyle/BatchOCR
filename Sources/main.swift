@@ -43,6 +43,9 @@ struct OCRSettings {
     var pdfa = false
     var jobs = max(1, min(8, ProcessInfo.processInfo.activeProcessorCount))
     var outputDir: URL?
+
+    /// 允许的并行度范围：GUI 与 CLI 共用同一约束。
+    static let jobsRange = 1...16
 }
 
 // MARK: - 引擎定位
@@ -126,6 +129,21 @@ struct OCRResult {
 enum OCRRunner {
     static let imageExts = ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]
     static let acceptedExts = ["pdf"] + imageExts
+
+    /// 递归收集目录下可处理的文件（含子目录、含图片），跳过隐藏文件；结果按路径排序。
+    /// CLI 与 GUI「添加文件夹」共用，保证两处行为一致。
+    static func collectInputs(in dir: URL) -> [URL] {
+        let keys: [URLResourceKey] = [.isRegularFileKey]
+        guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+        var found: [URL] = []
+        while let u = en.nextObject() as? URL {
+            guard acceptedExts.contains(u.pathExtension.lowercased()) else { continue }
+            let isFile = (try? u.resourceValues(forKeys: Set(keys)).isRegularFile) ?? false
+            if isFile { found.append(u) }
+        }
+        return found.sorted { $0.path < $1.path }
+    }
 
     static func resolveOutput(for input: URL, settings: OCRSettings) -> URL {
         let base = input.deletingPathExtension().lastPathComponent
@@ -228,39 +246,55 @@ func runCLI(_ args: [String]) -> Int32 {
       --mode skip|redo|force   skip=跳过已有文字层, redo=重做, force=强制整页
       --deskew --clean --rotate   纠偏 / 去噪 / 自动旋转
       --pdfa               输出 PDF/A
-      --jobs N             并行页数（默认 CPU 数）
+      --jobs N             并行页数，范围 1-16（默认 CPU 数，超范围自动夹取）
       --out DIR            输出目录（默认：源目录 + _ocr 后缀）
     每行输出: [OK|FAIL]\\t文件\\t详情
     """
     var s = OCRSettings()
     var inputs: [String] = []
     var i = 0
+    func fail(_ msg: String) -> Never {
+        fputs("\(msg)\n\(usage)\n", stderr); exit(2)
+    }
+    /// 取下一个 token 作为选项取值。缺失、或下一个 token 又是一个 "--" 选项时抛错，
+    /// 避免 `--out --deskew a.pdf` 把 `--deskew` 当成输出目录名。
+    func value(_ name: String) -> String {
+        guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+            fail("参数 \(name) 缺少取值（下一个 token 不是值）")
+        }
+        i += 1
+        return args[i]
+    }
     while i < args.count {
         let a = args[i]
-        func next(_ name: String) -> String? {
-            guard i + 1 < args.count else {
-                fputs("缺少 \(name) 的值\n", stderr); exit(2)
-            }
-            i += 1
-            return args[i]
-        }
         switch a {
-        case "--lang": s.languages = next("--lang") ?? "eng"
+        case "--lang":
+            let v = value("--lang").trimmingCharacters(in: .whitespaces)
+            if v.isEmpty { fail("参数 --lang 取值不能为空") }
+            s.languages = v
         case "--mode":
-            switch next("--mode") ?? "skip" {
+            switch value("--mode") {
+            case "skip": s.mode = .skipText
             case "redo": s.mode = .redoOcr
             case "force": s.mode = .forceOcr
-            default: s.mode = .skipText
+            case let other: fail("未知的 --mode 取值：\(other)（可选 skip | redo | force）")
             }
-        case "--jobs": s.jobs = Int(next("--jobs") ?? "") ?? s.jobs
-        case "--out": s.outputDir = URL(fileURLWithPath: next("--out") ?? ".").resolvingSymlinksInPath()
+        case "--jobs":
+            let raw = value("--jobs")
+            guard let n = Int(raw) else { fail("参数 --jobs 需要整数，收到：\(raw)") }
+            s.jobs = max(OCRSettings.jobsRange.lowerBound, min(OCRSettings.jobsRange.upperBound, n))
+        case "--out":
+            var dir = value("--out")
+            while dir.count > 1 && dir.hasSuffix("/") { dir.removeLast() }
+            s.outputDir = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+                .resolvingSymlinksInPath()
         case "--deskew": s.deskew = true
         case "--clean": s.clean = true
         case "--rotate": s.rotatePages = true
         case "--pdfa": s.pdfa = true
         case "--help", "-h": print(usage); return 0
         default:
-            if a.hasPrefix("-") { fputs("未知参数：\(a)\n\(usage)\n", stderr); return 2 }
+            if a.hasPrefix("-") { fail("未知参数：\(a)") }
             inputs.append((a as NSString).expandingTildeInPath)
         }
         i += 1
@@ -274,10 +308,7 @@ func runCLI(_ args: [String]) -> Int32 {
             fputs("不存在：\(path)\n", stderr); return 2
         }
         if isDir.boolValue {
-            let items = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
-            files += items
-                .filter { (URL(fileURLWithPath: $0).pathExtension.lowercased()) == "pdf" }
-                .sorted().map { URL(fileURLWithPath: path).appendingPathComponent($0) }
+            files += OCRRunner.collectInputs(in: URL(fileURLWithPath: path))
         } else {
             files.append(URL(fileURLWithPath: path))
         }
@@ -433,8 +464,8 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         rotateCheck = check("自动旋转")
         pdfaCheck = check("输出 PDF/A")
         jobsStepper = NSStepper()
-        jobsStepper.minValue = 1
-        jobsStepper.maxValue = 16
+        jobsStepper.minValue = Double(OCRSettings.jobsRange.lowerBound)
+        jobsStepper.maxValue = Double(OCRSettings.jobsRange.upperBound)
         jobsStepper.doubleValue = Double(settings.jobs)
         jobsStepper.target = self
         jobsStepper.action = #selector(stepperChanged)
@@ -537,11 +568,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         p.canChooseDirectories = true
         p.canChooseFiles = false
         guard p.runModal() == .OK, let dir = p.url else { return }
-        let items = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        let urls = items
-            .filter { OCRRunner.acceptedExts.contains(URL(fileURLWithPath: $0).pathExtension.lowercased()) }
-            .sorted().map { dir.appendingPathComponent($0) }
-        addURLs(urls)
+        addURLs(OCRRunner.collectInputs(in: dir))
     }
 
     @objc private func removeSelected() {
@@ -593,7 +620,9 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     // MARK: 选项
 
     @objc private func stepperChanged() {
-        settings.jobs = Int(jobsStepper.doubleValue)
+        settings.jobs = max(OCRSettings.jobsRange.lowerBound,
+                            min(OCRSettings.jobsRange.upperBound, Int(jobsStepper.doubleValue)))
+        jobsStepper.doubleValue = Double(settings.jobs)
         jobsLabel.stringValue = "并行 \(settings.jobs)"
     }
 
