@@ -2,3 +2,4 @@ build/
 test/out/
 test/samples/
 .DS_Store
+.mimosa/
