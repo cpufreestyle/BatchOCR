@@ -100,3 +100,10 @@ git push origin main && git push github main   # 双远端同步
 - `Info.plist` 最低系统版本 12.0 → 14.0（`NSApplication.activate()` 需要 macOS 14），并补充 png/jpeg/tiff 文档类型
 - 新增 `LICENSE`（MIT）与 `resources/AppIcon.icns`（`tools/make_icon.swift` 可复现生成，`build.sh` 自动拷入）
 - README / 本文档数字校正：文字层 445 / 262 / 473，ocrmypdf 17.13.0，双远端 main 已同步
+
+## 10. 修复记录（2026-10-04）
+
+- GUI 复杂控件补齐悬停解释（`toolTip`）：语言下拉、模式下拉（三种「跳过／重做／强制」区别）、四个复选（自动纠偏／去噪／自动旋转／输出 PDF/A）、并行页数 stepper、输出下拉，以及添加／移除／清空／开始 OCR／打开输出文件夹按钮，另加表格与状态提示
+- 说明文案统一为「它做什么 + 什么时候用」的一句白话，多行项用换行分点
+- 工厂函数 `label` / `check` / `button` 增加可选 `tip:` 参数，新增控件只需传文案
+- 回归：`./build.sh` 通过；`./test/run_tests.sh` → ALL TESTS PASSED ✅；GUI 实测悬停提示正常弹出

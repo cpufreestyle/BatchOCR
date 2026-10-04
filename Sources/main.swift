@@ -404,6 +404,31 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
 
     private var outputDirURL: URL?
 
+    // MARK: 悬停提示（复杂控件的一句话说明）
+
+    private let langTip = "识别所用的语言。中文文档选 chi_sim+eng（中英混排），纯英文选 eng。"
+        + "多个语言用 + 连接，语言越多识别越慢。"
+
+    private var modeTip: String {
+        "已有文字层的处理方式：\n"
+            + "· 跳过已有文字层 — 已有文字页原样保留，只补没文字层的页（推荐）\n"
+            + "· 重做已有文字层 — 在保留原文字的前提下重跑识别，修错误\n"
+            + "· 强制整页重新识别 — 丢弃原文字层，整页重新识别（最慢，易出错）"
+    }
+
+    private var jobsTip: String {
+        "同时处理的页数：数值越大越快，占用 CPU 越多。"
+            + "范围 \(OCRSettings.jobsRange.lowerBound)–\(OCRSettings.jobsRange.upperBound)，默认按本机核心数。"
+    }
+
+    private var outputTip: String {
+        "结果 PDF 的存放位置：\n"
+            + "· 输出到原目录 — 与原文件同目录，文件名加 _ocr 后缀，不覆盖原文件\n"
+            + "· 输出到指定文件夹 — 统一集中保存到你选择的文件夹"
+    }
+
+    private let statusTip = "队列概况：文件总数、已完成数与失败数。"
+
     // MARK: 窗口与布局
 
     func buildWindow() {
@@ -436,53 +461,66 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         tableView.rowHeight = 26
         tableView.allowsMultipleSelection = true
         tableView.usesAlternatingRowBackgroundColors = true
+        tableView.toolTip = "队列列表：每个文件的页数、体积与识别状态。改好上方选项后点「开始 OCR」批量处理。"
         scroll.documentView = tableView
 
         // 按钮行
-        addButton = button("添加 PDF…", #selector(chooseFiles))
-        addFolderButton = button("添加文件夹…", #selector(chooseFolder))
-        removeButton = button("移除所选", #selector(removeSelected))
-        clearButton = button("清空", #selector(clearAll))
+        addButton = button("添加 PDF…", #selector(chooseFiles),
+                           tip: "选择若干 PDF／图片加入队列。图片会自动转为 PDF 再识别。")
+        addFolderButton = button("添加文件夹…", #selector(chooseFolder),
+                                 tip: "选择文件夹，递归找出里面所有 PDF 与图片并加入队列（含子目录）。")
+        removeButton = button("移除所选", #selector(removeSelected),
+                              tip: "把选中条目移出列表，不会删除磁盘上的原文件。")
+        clearButton = button("清空", #selector(clearAll),
+                             tip: "清空整个列表。同样只影响列表，不碰原文件。")
 
         // 选项行 1：语言 / 模式
-        langTitle = label("识别语言：")
+        langTitle = label("识别语言：", tip: langTip)
         langCombo = NSComboBox()
         langCombo.completes = true
         let langs = Engine.installedLanguages()
         langCombo.removeAllItems()
         langCombo.addItems(withObjectValues: langs)
         langCombo.stringValue = langs.contains("chi_sim") ? "chi_sim+eng" : "eng"
+        langCombo.toolTip = langTip
 
-        modeTitle = label("模式：")
+        modeTitle = label("模式：", tip: modeTip)
         modePopup = NSPopUpButton()
         modePopup.addItems(withTitles: OCRSettings.Mode.allCases.map(\.label))
         modePopup.selectItem(at: 0)
+        modePopup.toolTip = modeTip
 
         // 选项行 2：开关 / 并行
-        deskewCheck = check("自动纠偏")
-        cleanCheck = check("去噪")
-        rotateCheck = check("自动旋转")
-        pdfaCheck = check("输出 PDF/A")
+        deskewCheck = check("自动纠偏", tip: "识别前先摆正倾斜的扫描页。只在页面歪斜时勾选，正常文档不必开。")
+        cleanCheck = check("去噪", tip: "抹掉扫描件的杂点与斑点，噪点多的复印件开启后识别更准。")
+        rotateCheck = check("自动旋转", tip: "按文字方向把横倒的页面转正。扫描时页面放歪了就勾选。")
+        pdfaCheck = check("输出 PDF/A", tip: "输出长期归档格式 PDF/A。适合存档，体积会略大；普通使用不必勾选。")
         jobsStepper = NSStepper()
         jobsStepper.minValue = Double(OCRSettings.jobsRange.lowerBound)
         jobsStepper.maxValue = Double(OCRSettings.jobsRange.upperBound)
         jobsStepper.doubleValue = Double(settings.jobs)
         jobsStepper.target = self
         jobsStepper.action = #selector(stepperChanged)
+        jobsStepper.toolTip = jobsTip
         jobsLabel = label("并行 \(settings.jobs)")
+        jobsLabel.toolTip = jobsTip
 
         // 选项行 3：输出
-        outTitle = label("输出：")
+        outTitle = label("输出：", tip: outputTip)
         outputPopup = NSPopUpButton()
         outputPopup.addItems(withTitles: ["输出到原目录（加 _ocr 后缀）", "输出到指定文件夹…"])
         outputPopup.target = self
         outputPopup.action = #selector(outputChanged)
+        outputPopup.toolTip = outputTip
 
         // 底部
-        startButton = button("开始 OCR", #selector(startOCR))
+        startButton = button("开始 OCR", #selector(startOCR),
+                             tip: "对列表中所有未完成文件批量识别；处理期间界面会暂时锁定。")
         startButton.keyEquivalent = "\r"
-        openFolderButton = button("打开输出文件夹", #selector(openFolder))
+        openFolderButton = button("打开输出文件夹", #selector(openFolder),
+                                  tip: "在访达中打开最近一次的输出位置。")
         statusLabel.alignment = .right
+        statusLabel.toolTip = statusTip
 
         engineLabel.font = .systemFont(ofSize: 10.5)
         engineLabel.textColor = .tertiaryLabelColor
@@ -543,12 +581,22 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         engineLabel.frame = NSRect(x: 14, y: y + 46, width: w - 28, height: 15)
     }
 
-    private func label(_ t: String) -> NSTextField { NSTextField(labelWithString: t) }
-    private func check(_ t: String) -> NSButton { NSButton(checkboxWithTitle: t, target: self, action: nil) }
+    private func label(_ t: String, tip: String? = nil) -> NSTextField {
+        let l = NSTextField(labelWithString: t)
+        l.toolTip = tip
+        return l
+    }
 
-    private func button(_ title: String, _ action: Selector) -> NSButton {
+    private func check(_ t: String, tip: String? = nil) -> NSButton {
+        let b = NSButton(checkboxWithTitle: t, target: self, action: nil)
+        b.toolTip = tip
+        return b
+    }
+
+    private func button(_ title: String, _ action: Selector, tip: String? = nil) -> NSButton {
         let b = NSButton(title: title, target: self, action: action)
         b.bezelStyle = .rounded
+        b.toolTip = tip
         return b
     }
 
