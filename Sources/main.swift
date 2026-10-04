@@ -65,6 +65,23 @@ enum Engine {
     static var ocrmypdfPath: String? { locate("ocrmypdf") }
     static var tesseractPath: String? { locate("tesseract") }
 
+    /// 从 Finder / Dock 启动时进程只继承极简 PATH（/usr/bin:/bin:/usr/sbin:/sbin），
+    /// ocrmypdf 会因此找不到 Homebrew 里的 tesseract 等子程序而失败（退出码 3）。
+    /// 这里为子进程补上 Homebrew 目录与引擎自身所在目录。
+    static func childEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        var dirs = (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin").split(separator: ":").map(String.init)
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/opt/homebrew/sbin", "/usr/local/sbin"] {
+            if !dirs.contains(extra) { dirs.append(extra) }
+        }
+        for bin in [ocrmypdfPath, tesseractPath].compactMap({ $0 }) {
+            let d = (bin as NSString).deletingLastPathComponent
+            if !dirs.contains(d) { dirs.append(d) }
+        }
+        env["PATH"] = dirs.joined(separator: ":")
+        return env
+    }
+
     static func unavailableReason() -> String? {
         if ocrmypdfPath == nil { return "未找到 ocrmypdf 引擎。请先运行：brew install ocrmypdf" }
         if tesseractPath == nil { return "未找到 tesseract。请先运行：brew install ocrmypdf" }
@@ -198,6 +215,7 @@ enum OCRRunner {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = args
+        p.environment = Engine.childEnvironment()
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -381,6 +399,10 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     private let tableView = NSTableView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let engineLabel = NSTextField(labelWithString: "")
+    /// 窗口未建好前（如冷启动时双击 PDF，openFiles 早于 didFinishLaunching）先缓存，
+    /// 等控件就绪再入列，避免对尚未创建的控件取值。
+    private var pendingURLs: [URL] = []
+    private var uiReady = false
     private var startButton: NSButton!
     private var addButton: NSButton!
     private var addFolderButton: NSButton!
@@ -437,10 +459,11 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         content.onFiles = { [weak self] in self?.addURLs($0) }
         content.onLayout = { [weak self] in self?.layoutContent() }
 
-        hintLabel = NSTextField(labelWithString:
-            "把 PDF（或图片）拖到这里 — 批量 OCR 生成可搜索 PDF · 引擎：OCRmyPDF + Tesseract（开源）")
+        // 拖拽提示：叠在表格之上，只在队列为空时显示，不占固定行高
+        hintLabel = NSTextField(labelWithString: "把 PDF 或图片拖到这里 — 批量 OCR 生成可搜索 PDF")
         hintLabel.font = .systemFont(ofSize: 12)
         hintLabel.textColor = .secondaryLabelColor
+        hintLabel.alignment = .center
 
         // 表格
         scroll.hasVerticalScroller = true
@@ -524,15 +547,19 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
 
         engineLabel.font = .systemFont(ofSize: 10.5)
         engineLabel.textColor = .tertiaryLabelColor
-        engineLabel.stringValue = "引擎：\(Engine.ocrmypdfPath ?? "未找到 ocrmypdf") · 语言包：\(langs.isEmpty ? "未知" : langs.joined(separator: " "))"
+        // 只留一句：引擎名 + 语言包数量。语言清单已在下拉里，不再整行铺开
+        engineLabel.stringValue = Engine.ocrmypdfPath == nil
+            ? "未找到 ocrmypdf — 请运行 brew install ocrmypdf"
+            : "引擎：ocrmypdf · 语言包 \(langs.count) 种"
 
-        for v: NSView in [hintLabel, scroll, addButton, addFolderButton, removeButton, clearButton,
+        for v: NSView in [scroll, addButton, addFolderButton, removeButton, clearButton,
                           langTitle, langCombo, modeTitle, modePopup,
                           deskewCheck, cleanCheck, rotateCheck, pdfaCheck, jobsStepper, jobsLabel,
                           outTitle, outputPopup,
                           startButton, openFolderButton, statusLabel, engineLabel] {
             content.addSubview(v)
         }
+        content.addSubview(hintLabel)   // 叠在表格之上
 
         let win = NSWindow(contentRect: content.bounds,
                            styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -540,45 +567,65 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         win.title = "BatchOCR — 批量 PDF OCR（基于开源 OCRmyPDF）"
         win.contentView = content
         win.center()
-        win.minSize = NSSize(width: 760, height: 600)
+        win.minSize = NSSize(width: 760, height: 380)
         window = win
         layoutContent()
+        uiReady = true
         refreshControls()
         updateStatus()
+        if !pendingURLs.isEmpty {   // 冷启动双击 PDF：把先到的文件补入列
+            let queued = pendingURLs
+            pendingURLs = []
+            addURLs(queued)
+        }
     }
 
     /// 手动确定性布局（flipped 坐标，自上而下）
     func layoutContent() {
         guard let cv = window?.contentView else { return }
         let w = cv.bounds.width, h = cv.bounds.height
-        hintLabel.frame = NSRect(x: 14, y: 10, width: w - 28, height: 18)
-        let scrollH = max(140, h - 410)
-        scroll.frame = NSRect(x: 14, y: 36, width: w - 28, height: scrollH)
-        var y = 36 + scrollH + 12
+        // 底部控件总占用：4 行（按钮 / 语言+模式 / 开关+输出 / 开始）+ 引擎行
+        let chromeH: CGFloat = 173
+        let scrollH = max(120, h - chromeH)
+        scroll.frame = NSRect(x: 14, y: 12, width: w - 28, height: scrollH)
+        hintLabel.frame = NSRect(x: 14, y: 12 + scrollH / 2 - 9, width: w - 28, height: 18)
+        hintLabel.isHidden = !items.isEmpty
+        var y = 12 + scrollH + 10
+
+        // 行 1：添加 / 移除
         addButton.frame = NSRect(x: 14, y: y, width: 108, height: 26)
         addFolderButton.frame = NSRect(x: 130, y: y, width: 124, height: 26)
         removeButton.frame = NSRect(x: 262, y: y, width: 92, height: 26)
         clearButton.frame = NSRect(x: 362, y: y, width: 64, height: 26)
-        y += 38
-        langTitle.frame = NSRect(x: 14, y: y + 5, width: 68, height: 18)
-        langCombo.frame = NSRect(x: 86, y: y, width: 190, height: 28)
-        modeTitle.frame = NSRect(x: 294, y: y + 5, width: 42, height: 18)
-        modePopup.frame = NSRect(x: 340, y: y, width: 214, height: 28)
-        y += 40
-        deskewCheck.frame = NSRect(x: 14, y: y + 2, width: 88, height: 22)
-        cleanCheck.frame = NSRect(x: 108, y: y + 2, width: 62, height: 22)
-        rotateCheck.frame = NSRect(x: 176, y: y + 2, width: 88, height: 22)
-        pdfaCheck.frame = NSRect(x: 270, y: y + 2, width: 104, height: 22)
-        jobsStepper.frame = NSRect(x: 388, y: y, width: 44, height: 26)
-        jobsLabel.frame = NSRect(x: 438, y: y + 4, width: 62, height: 18)
-        y += 38
-        outTitle.frame = NSRect(x: 14, y: y + 5, width: 44, height: 18)
-        outputPopup.frame = NSRect(x: 62, y: y, width: 264, height: 28)
-        y += 42
+        y += 34
+
+        // 行 2：识别语言 + 模式（合并原「选项行 1」）
+        langTitle.frame = NSRect(x: 14, y: y + 5, width: 62, height: 18)
+        langCombo.frame = NSRect(x: 78, y: y, width: 158, height: 26)
+        modeTitle.frame = NSRect(x: 244, y: y + 5, width: 38, height: 18)
+        modePopup.frame = NSRect(x: 284, y: y, width: 200, height: 26)
+        y += 32
+
+        // 行 3：开关（合并原「选项行 2」下半 + 「选项行 3」输出）
+        deskewCheck.frame = NSRect(x: 14, y: y + 1, width: 86, height: 20)
+        cleanCheck.frame = NSRect(x: 104, y: y + 1, width: 60, height: 20)
+        rotateCheck.frame = NSRect(x: 168, y: y + 1, width: 86, height: 20)
+        pdfaCheck.frame = NSRect(x: 258, y: y + 1, width: 100, height: 20)
+        jobsStepper.frame = NSRect(x: 366, y: y, width: 40, height: 24)
+        jobsLabel.frame = NSRect(x: 410, y: y + 2, width: 54, height: 18)
+        outTitle.frame = NSRect(x: 476, y: y + 1, width: 38, height: 18)
+        outputPopup.frame = NSRect(x: 516, y: y, width: max(200, w - 530), height: 24)
+        y += 36
+
+        // 行 4：开始 / 打开输出 + 状态
         startButton.frame = NSRect(x: 14, y: y, width: 112, height: 32)
         openFolderButton.frame = NSRect(x: 134, y: y + 2, width: 136, height: 28)
         statusLabel.frame = NSRect(x: w - 334, y: y + 7, width: 320, height: 18)
-        engineLabel.frame = NSRect(x: 14, y: y + 46, width: w - 28, height: 15)
+        y += 34
+
+        // 引擎行：只有异常（引擎缺失）时才显示，正常时隐藏以免整行铺满
+        engineLabel.isHidden = (Engine.unavailableReason() == nil)
+        engineLabel.frame = NSRect(x: 14, y: y, width: w - 28, height: 15)
     }
 
     private func label(_ t: String, tip: String? = nil) -> NSTextField {
@@ -636,6 +683,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     }
 
     func addURLs(_ urls: [URL]) {
+        guard uiReady else { pendingURLs.append(contentsOf: urls); return }
         guard !isRunning else { return }
         var added = false
         for u in urls {
@@ -762,6 +810,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     // MARK: 状态
 
     private func refreshControls() {
+        guard uiReady else { return }
         let engineOK = Engine.unavailableReason() == nil
         startButton.isEnabled = !isRunning && !items.isEmpty && engineOK
         addButton.isEnabled = !isRunning
@@ -774,15 +823,19 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         cleanCheck.isEnabled = !isRunning
         rotateCheck.isEnabled = !isRunning
         pdfaCheck.isEnabled = !isRunning
+        jobsStepper.isEnabled = !isRunning
+        jobsLabel.textColor = isRunning ? .tertiaryLabelColor : .labelColor
         outputPopup.isEnabled = !isRunning
     }
 
     private func updateStatus() {
+        guard uiReady else { return }
         let done = items.filter { $0.status == .done }.count
         let failed = items.filter { $0.status == .failed }.count
         statusLabel.stringValue = items.isEmpty
             ? "尚无文件"
             : "共 \(items.count) 个文件 · 完成 \(done) · 失败 \(failed)"
+        hintLabel?.isHidden = !items.isEmpty   // 空队列时才显示拖拽提示
         refreshControls()
     }
 
