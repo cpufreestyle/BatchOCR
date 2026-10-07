@@ -257,6 +257,10 @@ struct DocItem {
 
 // MARK: - CLI 模式（供脚本化验证与命令行使用）
 
+/// 版本号：与 resources/Info.plist 的 CFBundleShortVersionString 保持一致。
+/// harness（test/harness.py）会断言这里的输出，避免版本漂移。
+let batchOCRVersion = "1.0.0"
+
 func runCLI(_ args: [String]) -> Int32 {
     let usage = """
     用法: BatchOCR --cli [选项] <文件.pdf|目录> ...
@@ -311,9 +315,17 @@ func runCLI(_ args: [String]) -> Int32 {
         case "--rotate": s.rotatePages = true
         case "--pdfa": s.pdfa = true
         case "--help", "-h": print(usage); return 0
+        case "--version", "-v": print("BatchOCR \(batchOCRVersion)"); return 0
         default:
-            if a.hasPrefix("-") { fail("未知参数：\(a)") }
-            inputs.append((a as NSString).expandingTildeInPath)
+            var path = (a as NSString).expandingTildeInPath
+            if path.hasPrefix("-") {
+                // 以 "-" 开头的 token 默认按未知选项处理。但磁盘上确实存在同名文件时
+                // （例如目录里就有 -x.pdf），按文件输入接受，并补 "./" 前缀后交给引擎，
+                // 否则路径原样传给 ocrmypdf 会被当成选项解析。
+                guard FileManager.default.fileExists(atPath: path) else { fail("未知参数：\(a)") }
+                path = "./" + path
+            }
+            inputs.append(path)
         }
         i += 1
     }

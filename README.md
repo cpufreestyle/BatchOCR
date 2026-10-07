@@ -77,7 +77,39 @@ build/BatchOCR.app/Contents/MacOS/BatchOCR --cli \
 # 每行输出: [OK]\t文件\t输出路径\tpages=N\tchars=M
 ```
 
-## 5. 测试（端到端，可复跑）
+> 文件名以 `-` 开头时（如 `-x.pdf`），CLI 会把它当成文件输入并自动补上 `./` 前缀；目录里没这个文件时会报「未知参数」退出 2。
+
+## 5. 测试（端到端 + 契约）
+
+两套互补的验证入口，都以 `./build.sh` 的产物为被测对象：
+
+```bash
+./test/run_tests.sh      # 端到端：断言 OCR 识别质量（文字层字符数、关键词命中、恶劣条件）
+python3 test/harness.py  # 契约：逐条对照 docs/SPEC.md 断言行为契约
+python3 test/harness.py --fast   # 只跑静态 + CLI 解析契约，跳过真实 OCR（约 3 秒）
+```
+
+分工：`run_tests.sh` 断言「识别得对不对」，字符量与关键词会随引擎版本小幅浮动；
+`harness.py` 断言「契约是否被遵守」——选项语义、退出码、命名规则、GUI 源码不变量、样例确定性，结果稳定可重复。
+harness 全量约 20 秒（含真实 OCR），末行给出结论与退出码：
+
+```
+harness 结果：38 通过 · 0 失败 · 0 跳过
+HARNESS PASSED ✅
+```
+
+下表是 harness 当前覆盖的条目（编号对应 [docs/SPEC.md](docs/SPEC.md)）：
+
+| 段 | 覆盖条目 | 内容 |
+|---|---|---|
+| A | S-01/S-02/S-03 | 版本号代码与 Info.plist 一致、`--version` 输出、最低系统版本与文档类型声明 |
+| B | C-B1…C-B12 | 每个选项的取值守卫、退出码语义、`-` 开头 token 的归属判定 |
+| C | C-C1…C-C5 | 目录递归收集范围、默认命名与冲突加序号、图片输入命名、输出路径为绝对路径 |
+| D | C-D1…C-D4、S-20/S-21 | 三类样例的文字层、页数一致、倾斜噪点 + 纠偏压测 |
+| E | C-E1/S-23 | `sample_tool gen` 两次生成的样例图像内容逐像素一致 |
+| F | S-30…S-32 | GUI 源码不变量（手动布局、冷启动缓存、子进程 PATH、toolTip） |
+
+### 5.1 端到端验证（识别质量）
 
 ```bash
 ./test/run_tests.sh
@@ -91,16 +123,20 @@ build/BatchOCR.app/Contents/MacOS/BatchOCR --cli \
    （英文样本近乎完美：`INVOICE Invoice Number: INV-2026-0930 Total Amount Due: $1,234.56 …`）；
 4. 输出 `ALL TESTS PASSED ✅`。
 
-### 恶劣条件压测（第 5 段）
+> 这三组字符数现在可稳定复现：`sample_tool` 的渲染噪点改用固定随机种子（`SeededRandom`），同样的输入不会再造出不同的扫描件。
+
+### 5.2 恶劣条件压测（第 5 段）
 
 `sample_tool gen … stress` 生成「整页旋转 2° + 4 万噪点」的仿真扫描件，对照组/实验组对比：
 
 | 条件 | 命令 | 结果 |
 |---|---|---|
-| 不开纠偏/去噪 | `--cli` 仅基础参数 | 301 字符，但大写金额识别为乱码（`ARMS TAGS…`），语序错乱 |
-| **开纠偏+去噪** | `--cli --deskew --clean` | **315 字符，`发票号码/总金额/银行转账/科技` 关键词全命中**，且输出页面被自动摆正、噪点清除（视觉修复） |
+| 不开纠偏/去噪 | `--cli` 仅基础参数 | **261 字符**；但大写金额的行首字段被识别成乱码（`ARMS TASER hAD`） |
+| **开纠偏+去噪** | `--cli --deskew --clean` | **257 字符**，`总金额/人民币/转账/科技/惠顾` 关键词命中；输出页面被自动摆正、噪点清除（视觉修复） |
 
 实测说明：`--deskew --clean` 不只加文字层，还会把倾斜页面转正、清理噪声——付费软件宣传的"扫描件修复"效果。
+
+> 这组数字同样来自固定种子，重跑一致。倾斜 2° 的压迫下，两组各有丢字段的表现（对照组丢了大写金额的行首小字段、实验组丢了最上方的标题字段），属于 Tesseract 的识别短板而非本项目的逻辑问题——`harness.py` 因此只对该样例断言"有合格文字层"（C-D4），不断言具体关键词。
 
 > 说明：OCR 会在图片型页面上叠加文字层，体积略增（本例 +4%~8%）属正常现象；付费软件同样如此。
 
@@ -115,7 +151,9 @@ BatchOCR/
 ├── LICENSE                 # MIT
 ├── build.sh                # 构建（swiftc，无需 Xcode 工程）
 ├── setup.sh                # 引擎安装与中文语言包补齐
-├── test/run_tests.sh       # 端到端验证脚本
+├── test/run_tests.sh       # 端到端验证脚本（识别质量）
+├── test/harness.py         # 契约验证脚本（逐条对照 docs/SPEC.md）
+├── docs/SPEC.md            # 行为契约：版本、CLI、输出格式、GUI 不变量、变更流程
 └── build/BatchOCR.app      # 构建产物（ad-hoc 签名）
 ```
 

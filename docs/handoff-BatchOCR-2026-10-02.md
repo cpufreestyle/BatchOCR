@@ -117,3 +117,94 @@ git push origin main && git push github main   # 双远端同步
 - 修复：Finder 冷启动双击 PDF 会崩溃 —— `openFiles` 早于窗口构建，`addURLs` 对尚未创建的控件取值（EXC_BREAKPOINT，自 2026-09-30 起存在）；改为控件就绪前先缓存 URL，就绪后补入列
 - 修复：Finder / Dock 启动时进程只继承极简 PATH，ocrmypdf 找不到 tesseract（退出码 3）；子进程环境补上 `/opt/homebrew/bin` 与引擎所在目录
 - 回归：`./build.sh` 通过；`./test/run_tests.sh` → ALL TESTS PASSED ✅；GUI 冷启动双击入列 → 开始 OCR → 完成 2 · 失败 0
+
+## 11. 修复记录（2026-10-07）：建立 SPEC 契约与 harness
+
+### 11.1 动机
+
+此前的验证只有 `test/run_tests.sh` 一条路径，它断言 OCR 的**识别质量**：生成仿真扫描件、跑批量识别、检查文字层字符量与关键词。
+这条路径有两个盲区：
+
+1. **数值不可复现**：`sample_tool` 渲染噪点用 `CGFloat.random`，每跑一次生成的扫描件都不同，README 里的「301→315 字符」只是某一次的观测值，重跑不一定成立。
+2. **契约没人守**：CLI 的选项语义、退出码、输出命名规则、GUI 的源码不变量（手动布局、冷启动缓存、子进程 PATH），没有任何自动化检查在改坏时报警。
+
+### 11.2 新增的正式契约（`docs/SPEC.md`）
+
+把散落在 README、代码注释里的口头约定整理为编号条目，每条都标注「谁来验证」：
+
+- **§2 版本与产物**（S-01…S-03）：版本号在 `Sources/main.swift` 与 `Info.plist` 双处一致、`./build.sh` 产物清单、最低系统版本 14.0 与文档类型声明。并明确规定：改版本必须同时改两处。
+- **§3 CLI 契约**：完整选项表（含每个选项的取值域与守卫）、退出码语义（0 成功 / 1 有失败 / 2 用法与环境错）、stdout 的 `[OK]\t文件\t路径\tpages=N\tchars=M` 行格式、stderr 进度行、输出命名 `<原名>_ocr.pdf` 与冲突递增 `_2`/`_3`。
+- **§4 识别与结果校验**（S-20…S-23）：chars>0、页数一致、倾斜压测、以及**确定性**这一条。
+- **§5 GUI 不变量**（S-30…S-35）：flipped 手动布局不得回退 NSStackView、冷启动 `pendingURLs`/`uiReady` 缓存、子进程 PATH 补全、isRunning 禁用、拖拽浮层、toolTip。
+- **§7 变更流程**：改行为 → 先改 SPEC → 加 harness 检查 → `./build.sh && python3 test/harness.py` 通过 → 提交。
+
+### 11.3 新增的契约 harness（`test/harness.py`）
+
+只依赖标准库与已构建产物，按 SPEC 编号分段，每条断言都标注来源编号，失败时直接定位到契约条目。当前 **38 条断言全绿**：
+
+| 段 | 条数 | 断言内容 |
+|---|---|---|
+| A | 5 | 版本一致性、`--version`、最低系统版本、文档类型（plistlib 读 Info.plist） |
+| B | 14 | 每个选项的取值守卫、退出码语义、`-` 开头 token 归属判定 |
+| C | 8 | 目录递归收集范围、默认命名、冲突递增、图片输入命名、输出为绝对路径 |
+| D | 7 | 三类样例文字层、页数一致、倾斜 + 纠偏压测（真实 OCR） |
+| E | 1 | 同参数两次生成的样例图像内容逐像素一致 |
+| F | 4 | GUI 源码静态不变量 |
+
+用法：
+
+```bash
+python3 test/harness.py           # 全量约 20 秒
+python3 test/harness.py --fast    # 跳过真实 OCR 段，约 3 秒
+```
+
+退出码 0/1，末行输出 `HARNESS PASSED ✅` / `HARNESS FAILED ❌`。
+引擎缺失（未装 ocrmypdf）时 D 段自动 SKIP 而不是误报失败。
+
+### 11.4 顺带修掉的两个实现问题
+
+**（a）`-` 开头文件名的参数误读**
+
+CLI 原先对所有 `-` 开头 token 一律判「未知参数」，于是目录里真有个 `-x.pdf` 时无法处理；
+而改成无脑接受又会让手误的选项拼写静默变成文件路径。最终规则是**先查磁盘**：
+同名文件存在 → 按输入接受，并自动补 `./` 前缀后交给 ocrmypdf（原样传会被引擎当成选项）；
+不存在 → 报「未知参数」退出 2。SPEC 的 S-11 已按此改写，harness 补了 C-B4 与 C-B12 两条断言分别钉住两个分支。
+
+**（b）噪点随机导致样例不可复现**
+
+`sample_tool` 的 `renderPageImage` 改用固定种子的 xorshift64*（`SeededRandom`，种子 `0xBC0C_2026_1004`），
+同参数两次生成的扫描件图像内容完全一致。SPEC 的 S-23 明确规定**只断言图像内容**：
+CGContext 会把生成时间写进 PDF 的 `CreationDate`/`ID`，原始字节必然每次不同，拿 SHA-256 比文件是错的断言。
+为此给 `sample_tool` 加了 `pixelhash` 子命令（渲染各页后做 FNV-1a 像素哈希），harness 的 E 段用它比对。
+
+### 11.5 踩到的坑
+
+- **确定性断言的粒度**：一开始用 SHA-256 比整个 PDF，结果两次必然不同（CGContext 写时间戳）。先怀疑是种子没生效，
+  用 `cmp -l` 数出只差 58 字节、且全部落在 PDF trailer 的日期/ID 字段，才确认种子是对的、断言写粗了。
+- **harness 自己污染夹具**：C 段最初三个用例共用一个输出目录，导致「默认命名」断言测到的其实是 `_ocr_2.pdf`。
+  这是 harness 的 bug，不是实现的 bug——每个命名用例现在各自用独立目录。
+- **README 用 heredoc 写会炸**：`<<EOF`（未加引号）时文档里的反引号被 shell 当命令执行，把正文切成逐字符碎片。
+  必须用带引号的 `<<'EOF'`，或干脆写文件再由 Python 读取插入。
+
+### 11.6 回归结果
+
+- `./build.sh` → 通过（无警告）
+- `python3 test/harness.py` → **38 通过 · 0 失败 · 0 跳过**
+- `python3 test/harness.py --fast` → 24 通过 · 0 失败 · 2 跳过
+- `./test/run_tests.sh` → `ALL TESTS PASSED ✅`，字符数 445 / 262 / 473 现已稳定复现；压测 261 / 257
+
+### 11.7 两套脚本的分工（别合并）
+
+`run_tests.sh` 与 `harness.py` 故意保持独立，因为失败信息的含义不同：
+
+- `run_tests.sh` 失败 → **识别质量**出问题：引擎版本、语言包、渲染质量。它的数值会随 tesseract 版本浮动。
+- `harness.py` 失败 → **行为契约**被破坏：改坏了选项语义、改名规则、版本漂移、GUI 不变量。它必须稳定可重复，否则等于没有检查。
+
+合二为一会让两者互相拖累（识别质量的浮动让契约检查偶发失败），反而失去意义。
+
+### 11.8 交接给下一轮
+
+- SPEC 里 S-33（isRunning 禁用）、S-34（拖拽浮层）、S-35（toolTip）仍是人工验证项，因为 GUI 不可在 harness 里驱动。
+  S-35 已由源码静态检查覆盖大半（工厂函数带 `tip:` 参数 + 各控件赋值）；S-33/S-34 若要自动化，需要辅助功能（AX）探测或截图比对。
+- `harness.py` 的 C 段依赖 `test/samples/invoice_en.pdf`（`.gitignore` 忽略）。样例缺失时该段 SKIP 并提示，跑 `./test/run_tests.sh` 会生成。
+- SPEC §7 的流程已写进文档，但没有 CI 卡点（无 Xcode 工程、无 GitHub Actions）。若要自动化，把 `./build.sh && python3 test/harness.py --fast` 挂上去即可。
