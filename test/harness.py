@@ -120,6 +120,16 @@ def section_b(tmp):
     rc, out, _, _ = cli("-h")
     check("C-B1", "-h 退出码 0", rc == 0, f"rc={rc}")
 
+    rc, out, err, _ = cli("--version")
+    check("C-B2", "--version 打印 BatchOCR <版本> 且退出码 0",
+          rc == 0 and re.match(r"^BatchOCR \d+\.\d+\.\d+$", out.strip()) is not None,
+          f"rc={rc} out={out.strip()!r}")
+
+    rc, out, err, _ = cli("-v")
+    check("C-B2", "-v 是 --version 的别名，输出一致",
+          rc == 0 and out.strip() == cli("--version")[1].strip(),
+          f"rc={rc} out={out.strip()!r}")
+
     rc, out, err, _ = cli("--mode", "bogus", "x.pdf")
     check("C-B5", "--mode 非法值报错退出 2", rc == 2 and "未知的 --mode" in err, f"rc={rc} err={err.strip()[:80]}")
 
@@ -240,7 +250,42 @@ def section_c(tmp):
     rc, out, err, _ = cli("--lang", "eng", "--out", os.path.join(tmp, "out-rel"), "tree/a.pdf", cwd=tmp)
     _, pr = ocr_line(out)
     check("S-10", "相对输入 → 输出为绝对路径",
-          pr is not None and os.path.isabs(pr), f"path={pr!r} rc={rc} err={err.strip()[-100:]}")
+         pr is not None and os.path.isabs(pr), f"path={pr!r} rc={rc} err={err.strip()[-100:]}")
+
+    # --- C-C3：--out 自动创建（含多级）、~ 展开、去尾斜杠 ---
+    nested = os.path.join(tmp, "made", "up", "dir")
+    rc, out, err, _ = cli("--lang", "eng", "--out", nested + "/", os.path.join(tree, "a.pdf"))
+    _, pn = ocr_line(out)
+    check("C-C3", "--out 自动创建多级目录（尾部斜杠被去掉）",
+          pn is not None and os.path.dirname(pn) == nested and os.path.isdir(nested),
+          f"path={pn!r} rc={rc} err={err.strip()[-100:]}")
+
+    # 注意：expandingTildeInPath 读的是 passwd 里的真实主目录，不认 HOME 环境变量，
+    # 所以只能在真主目录下建临时子目录验证，跑完立刻清理。
+    tilde_dir = ".batchocr-harness-tilde-" + os.path.basename(tmp)
+    tilde_target = os.path.join(os.path.expanduser("~"), tilde_dir)
+    os.makedirs(tilde_target, exist_ok=True)
+    try:
+        rc, out, err, _ = cli("--lang", "eng", "--out", "~/" + tilde_dir, os.path.join(tree, "a.pdf"))
+        _, ptilde = ocr_line(out)
+        check("C-C3", "--out 展开 ~",
+              ptilde is not None and os.path.dirname(ptilde) == tilde_target and os.path.isdir(tilde_target),
+              f"path={ptilde!r} want={tilde_target!r} rc={rc}")
+    finally:
+        shutil.rmtree(tilde_target, ignore_errors=True)
+
+    # --- C-C3：--pdfa 产出 PDF/A（PDFKit 能解析且仍带文字层）---
+    if shutil.which("ocrmypdf") or os.path.exists("/opt/homebrew/bin/ocrmypdf"):
+        pa = os.path.join(tmp, "out-pdfa")
+        rc, out, err, _ = cli("--lang", "eng", "--pdfa", "--out", pa, os.path.join(tree, "a.pdf"))
+        _, ppa = ocr_line(out)
+        rc2, out2, _, _ = run([TOOL, "inspect", ppa]) if ppa else (1, "", "", 0)
+        mp = re.search(r"chars=(\d+)", out2)
+        check("C-C3", "--pdfa 输出可解析且文字层非空",
+              ppa is not None and os.path.isfile(ppa) and mp is not None and int(mp.group(1)) > 0,
+              f"path={ppa!r} rc={rc} inspect={out2.strip()[:80]!r} err={err.strip()[-100:]}")
+    else:
+        record(SKIP, "C-C3", "--pdfa 输出检查（引擎缺失，跳过）")
 
 
 # ------------------------------------------------------- D. 真实 OCR 段落
@@ -282,11 +327,11 @@ def section_d(tmp):
         return int(m.group(1)) if m else -1
 
     c_en = chars_of("en_ocr.pdf")
-    check("S-20", "英文样例 chars>0", c_en > 100, f"chars={c_en}")
+    check("C-D1", "英文样例 chars>0", c_en > 100, f"chars={c_en}")
     c_zh = chars_of("zh_ocr.pdf")
-    check("S-20", "中文样例 chars>0", c_zh > 100, f"chars={c_zh}")
+    check("C-D3", "中文样例 chars>0", c_zh > 100, f"chars={c_zh}")
     c_mixed = chars_of("mixed_ocr.pdf")
-    check("S-20", "中英混排样例 chars>0", c_mixed > 100, f"chars={c_mixed}")
+    check("C-D2", "中英混排样例 chars>0", c_mixed > 100, f"chars={c_mixed}")
 
     # 关键词命中（归一化去空格）
     def norm(name):
@@ -303,7 +348,7 @@ def section_d(tmp):
     # 页数一致
     rc, out, err, _ = run([TOOL, "inspect", os.path.join(out_dir, "mixed_ocr.pdf")])
     m = re.search(r"pages=(\d+)", out)
-    check("S-21", "输出页数与输入一致（3 页）", m and m.group(1) == "3", out[:80])
+    check("C-D2", "输出页数与输入一致（3 页）", m and m.group(1) == "3", out[:80])
 
     # 倾斜压测：开纠偏+去噪
     rc, out, err, _ = cli("--lang", "chi_sim+eng", "--mode", "skip", "--jobs", "4",
@@ -334,7 +379,52 @@ def section_e(tmp):
 
     h1, h2 = ph(d1), ph(d2)
     check("C-E1", "同参数两次生成的压测样例图像内容一致（噪点种子固定）",
-          h1 is not None and h1 == h2, f"{h1} vs {h2}")
+              h1 is not None and h1 == h2, f"{h1} vs {h2}")
+
+
+# ------------------------------------------------- G. SPEC 与 harness 对账
+def section_g():
+    """G. 对账：SPEC「验证」列声称的每个 C-* 编号都必须真有对应断言。
+
+    防止最常见的漂移——条款表里填了编号，harness 里却没有这条检查。
+    """
+    print("\nG. SPEC 与 harness 对账")
+    try:
+        spec = open(SPEC, encoding="utf-8").read()
+        src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    except OSError as e:
+        record(FAIL, "G-01", "读取 SPEC 或 harness 源码失败", str(e))
+        return
+
+    # SPEC 侧：所有出现过的 C-* 编号（条款表 + 正文说明）
+    claimed = set(re.findall(r"C-[A-Z]\d+", spec))
+    # harness 侧：check(...) / record(...) 的第一个字符串实参
+    checked = set(re.findall(r'(?:check|record)\(\s*(?:PASS|FAIL|SKIP)\s*,\s*"([SC]-[A-Z0-9]+)"', src))
+    checked |= set(re.findall(r"(?:check|record)\(\s*(?:PASS|FAIL|SKIP)\s*,\s*'([SC]-[A-Z0-9]+)'", src))
+    # check(spec_id, name, ...) 的第一个实参就是编号（无需状态前缀）
+    checked |= set(re.findall(r'check\(\s*"([SC]-[A-Z0-9]+)"', src))
+
+    missing = sorted(claimed - checked)
+    check("G-01", "SPEC 声称的 C-* 编号都有对应断言",
+          not missing, f"声称但未检查：{missing}")
+
+    orphan = sorted(c for c in checked - claimed if c.startswith("C-"))
+    check("G-02", "没有 SPEC 未声明的孤儿断言",
+          not orphan, f"断言了但 SPEC 没写：{orphan}")
+
+    # SPEC 里每一条 S-xx 都要么被 harness 引用，要么明说人工/manual
+    spec_ids = set(re.findall(r"\|\s*(S-\d+)\s*\|", spec))
+    unverified = []
+    for line in spec.splitlines():
+        m = re.match(r"\|\s*(S-\d+)\s*\|.*\|\s*([^|]+?)\s*\|\s*$", line)
+        if not m:
+            continue
+        sid, how = m.group(1), m.group(2)
+        automated = sid in src or re.search(r"C-[A-Z]\d+", how)
+        if not automated and not re.search(r"人工|手动", how):
+            unverified.append(f"{sid}（验证方式：{how}）")
+    check("G-03", "每条 S-xx 都有明确的验证方式（自动或人工）",
+          not unverified, f"缺少验证方式：{unverified}")
 
 
 # ------------------------------------------------------------------ 主流程
@@ -353,6 +443,7 @@ def main():
         section_f()
         section_b(tmp)
         section_e(tmp)
+        section_g()
         if args.fast:
             record(SKIP, "C-C*", "输入收集/输出命名（--fast 跳过）")
             record(SKIP, "C-D*", "识别段（--fast 跳过）")
