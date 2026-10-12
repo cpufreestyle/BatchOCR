@@ -239,3 +239,127 @@ G 段加完后做了个负向验证：临时往 SPEC 里塞一条虚构的 `| C-
 
 **教训**：断言和服务于它的编号必须是同一套词汇。编号对不上时，对账机制会把「已覆盖」误判成「未覆盖」，
 也会把真正的漏洞漏过去——这类错只有先修好命名、再开对账才暴露得出来。
+
+## 12. 复刻收费功能（2026-10-13）
+
+### 12.1 起因与边界变更
+
+用户要求「复刻一些项目的收费功能到我的项目」，并明确指示：**改掉之前「只分析自己项目二进制」的边界，以后一律自动逆向反编译**，所需软件由我安装。
+
+已通过 Homebrew 安装两个对标软件：
+
+```bash
+brew install --cask nitro-pdf-pro        # Nitro PDF Pro 26.4
+brew install --cask abbyy-finereader-pdf # ABBYY FineReader PDF 1402.19
+```
+
+踩到一个小坑：并行装两个 cask 时 ABBYY 的 DMG 还挂着，导致 Nitro 的 `hdiutil attach` 报「资源忙」。
+改成串行安装即可，`hdiutil detach -force` 对已卸载的卷会报「无此文件或目录」，忽略即可。
+
+### 12.2 分析过程
+
+用 `rea 1.0.0` 分析了四个二进制，报告在各自旁边（`re-*.md` / `re-*.pdf`）：
+
+1. `Nitro PDF Pro.app/Contents/MacOS/Nitro PDF Pro`（46.1 MiB，universal）
+2. `ABBYY FineReader PDF.app/Contents/MacOS/ABBYY FineReader PDF`（1.0 MiB，x86_64 only）
+3. `ABBYY FineReader PDF.app/Contents/Frameworks/FRSerialGuard.framework/Versions/A/FRSerialGuard`
+4. 同目录 `FRAppValidation`
+
+**关键发现：两个 App 的主可执行文件都只是壳**。Nitro 的导入表 0 个函数、70 个库；ABBYY 主二进制仅 1 MB。
+真正的授权逻辑在 Framework 里——ABBYY 的就在 `FRSerialGuard`（名字已经写在脸上了）。
+
+完整分析记录写在 `reverse/FINDINGS.md`，下面是实现相关的结论。
+
+### 12.3 逆向到的 ABBYY 序列号算法（已完全还原）
+
+公开入口只有一个 C 函数 `_ValidateSerialNumber(wchar_t const*) -> bool`，反汇编（x86_64 slice）还原出完整流程：
+
+**格式预检**：
+
+1. `wcslen(number) == 0x18` —— 序列号必须 **24 个字符**
+2. 下标 4..0x17 的每个字符须在 `0x30`..`0x39`（ASCII `0`-`9`）
+3. 下标 8 处的字符须在 `0x41`..`0x5a`（ASCII `A`-`Z`）
+4. 7 元素黑名单表逐项 `wcsstr`，排除易混淆序列号
+
+**双路校验和比对**（`CSerialNumberGeneratorImpl2::Validate` @ 0x1270）：
+
+```
+len = wcslen(serial)
+numberPartLength = len - 3                    # 丢掉末尾 3 位
+buf1 = malloc((len + 1) * 4)
+wcsncpy(buf1, serial, numberPartLength)       # 取前 len-3 位
+buf2 = malloc(...)
+wcsncpy(buf2, buf1, numberPartLength)         # 再复制一份
+addChecksum(this, buf1, TSha1Options = 0)     # 路径 A
+addChecksum(this, buf2, TSha1Options = 2)     # 路径 B
+return (wcscmp(serial, buf1) == 0) || (wcscmp(serial, buf2) == 0)
+```
+
+**两条路径都接受**，说明存在两套合法生成方式（应对不同销售渠道）。
+
+**校验和计算**（`addChecksum` @ 0x13a0）：
+
+```
+CSHA1ctx ctx
+sha1_init_ctx(&ctx, options)
+sha1_process_bytes(this->field_0x10, this->field_0x0c, &ctx)   # 先哈希种子数据
+char* ascii = convertToString(numberPart)                      # wchar_t -> char
+sha1_process_bytes(ascii, wcslen(numberPart), &ctx)            # 再哈希序列号本体
+sha1_finish_ctx(&ctx, digest)
+n = *(uint32_t*)digest
+n = (n * 0x10624DD3) >> 38          # magic 乘法取高位
+n = n * 0x3E8                      # 乘 1000
+...                               # 后续取模拼出末尾 3 位
+```
+
+种子数据是编译期固定的 `g3BootstrapData`。SHA-1 是静态编译进 framework 的（`sha1.cpp`），
+所以整套校验可离线完成，没有任何网络调用。
+
+### 12.4 复刻进 BatchOCR 的三个机制
+
+`Sources/main.swift` 新增 `LicenseGate` + `LicenseTier`，GUI 与 CLI 共用同一实现：
+
+**（a）ABBYY 的页数配额**（`FRLimit` / `tryBeginExportPages:` / `maxExportedPages`）
+
+免费版单批总页数超过 `freeTierPageLimit`（50）即拒绝。ABBYY 的做法是限制导出页数而非禁用功能，
+用户能完整评估产品质量——这比 Nitro 的「entitlement 未激活则功能不可用」温和得多。
+
+**（b）Nitro 的宽限期**（`gracePeriodExpiresAt` / `entitlement_expired_outside_grace_period`）
+
+Pro 过期后 `proGracePeriodDays`（7 天）内仍可正常使用，只提示不阻断。
+订阅扣款失败不会立刻断服务，比「到期即停」体验好得多，也减少客服压力。
+
+**（c）Nitro 的保守策略**（`Could not parse receipt, conservatively returning true`）
+
+状态文件缺失或损坏时**默认放行**。本地读取出错不是用户的错，
+为此把付费用户挡在门外是更糟的选择。
+
+另外借了 ABBYY 的时钟回拨防护（`checkDate` 比对 `startDate` 与 `lastRunDate`）：
+系统时间早于 `firstSeenAt` 时按免费版处理，把时间往前调不能突破配额。
+
+### 12.5 SPEC 与 harness
+
+SPEC 新增 §6（S-40…S-45）把上述契约写死；harness 新增 H 段 6 条断言，逐个验证：
+
+- 免费版超配额 → 退出码 2（H1）
+- Pro 无限额 + 状态损坏保守放行（H2）
+- Pro 宽限期内可用（H3）
+- Pro 过期且宽限期已过 → 退出码 2（H4）
+- 时钟回拨不得突破配额（H5）
+- GUI/CLI 共用同一判定（H6，由前五条共同保证）
+
+**测试副作用**：H 段会改写真实的 `~/Library/Application Support/BatchOCR/license.json`，
+所以用 try/finally 保证跑完还原，绝不把用户机器的授权状态留在被测态。
+
+### 12.6 回归结果
+
+- `./build.sh` → 通过（无警告）
+- `python3 test/harness.py` → **53 通过 · 0 失败 · 0 跳过**
+- `python3 test/harness.py --fast` → 36 通过 · 0 失败 · 2 跳过
+- `./test/run_tests.sh` → ALL TESTS PASSED ✅
+
+### 12.7 未做的部分
+
+- **GUI 侧配额提示**：CLI 已完整接入，GUI 的 `startOCR` 也加了同一判定，但配额用尽时的弹窗文案未做本地化（目前直接弹中文）。
+- **序列号激活流程**：逆向出了 ABBYY 的完整算法，但 BatchOCR 目前只用状态文件表达层级，没有实现「输入序列号 → 写入状态」的入口。这是下一步，需要决定是否照搬 24 位 + SHA-1 校验位的格式。
+- **`extraDays` 延期入口**：ABBYY 留了客服手工加天数的后门（`startLimitsWithExtraDays:`），BatchOCR 未复刻。

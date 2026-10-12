@@ -255,6 +255,129 @@ struct DocItem {
     var note = ""
 }
 
+// MARK: - 授权与配额（复刻自 ABBYY FineReader 的试用配额 + Nitro 的宽限期）
+
+/// 免费版单批可处理的页数上限。超过即按配额制拦截（对应 ABBYY 的 `maxExportedPages`）。
+let freeTierPageLimit = 50
+
+/// Pro 过期后的宽限期天数（对应 Nitro 的 `gracePeriodExpiresAt`）。
+let proGracePeriodDays = 7
+
+enum LicenseTier: Equatable {
+    case free
+    case trial
+    case pro
+    /// Pro 已过期但在宽限期内：`graceUntil` 为宽限期截止日。
+    case proExpired(graceUntil: Date)
+    /// Pro 已过期且宽限期已过：降级为只读（对应 ABBYY 的
+    /// `MSG_COMMON_TRIAL_EXPIRED_CONTINUE_USING_VIEWER`）。
+    case expired
+
+    var isUsable: Bool {
+        switch self {
+        case .free, .trial, .pro, .proExpired: return true
+        case .expired: return false
+        }
+    }
+
+    /// 是否需要提示用户（宽限期内要提醒，正常态不打扰）。
+    var needsNotice: Bool {
+        if case .proExpired = self { return true }
+        return false
+    }
+}
+
+/// 授权判定的唯一事实来源。GUI 与 CLI 共用，避免「界面说能用、命令行却能跑」的割裂。
+enum LicenseGate {
+
+    /// 状态文件位置：Application Support/BatchOCR/license.json
+    static var stateURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("BatchOCR/license.json")
+    }
+
+    /// 读取并判定当前授权层级。
+    ///
+    /// 保守策略（复刻自 Nitro 的 `conservatively returning true`）：
+    /// 状态文件缺失或解析失败时默认放行，不因本地读取出错把用户挡在门外。
+    static func currentTier() -> LicenseTier {
+        guard let data = try? Data(contentsOf: stateURL),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let dict = obj as? [String: Any] else {
+            return .free
+        }
+
+        // 时钟回拨防护：系统时间早于首次记录时间时，按免费版处理。
+        // 对应 ABBYY 的 `checkDate`（比对 startDate 与 lastRunDate）。
+        let now = Date()
+        if let first = dict["firstSeenAt"] as? TimeInterval, now.timeIntervalSince1970 < first {
+            return .free
+        }
+
+        guard let kind = dict["tier"] as? String else { return .free }
+        switch kind {
+        case "pro":
+            if let exp = dict["expiresAt"] as? TimeInterval {
+                let expiry = Date(timeIntervalSince1970: exp)
+                let grace = expiry.addingTimeInterval(TimeInterval(proGracePeriodDays * 86400))
+                if now < expiry { return .pro }
+                if now < grace { return .proExpired(graceUntil: grace) }
+                return .expired
+            }
+            return .pro
+        case "trial": return .trial
+        default: return .free
+        }
+    }
+
+    /// 首次运行时记录时间戳，供时钟回拨检测使用。
+    static func recordFirstSeenIfNeeded() {
+        let url = stateURL
+        if let data = try? Data(contentsOf: url),
+           let obj = try? JSONSerialization.jsonObject(with: data),
+           let dict = obj as? [String: Any],
+           dict["firstSeenAt"] != nil {
+            return
+        }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        let dict: [String: Any] = ["tier": "free", "firstSeenAt": Date().timeIntervalSince1970]
+        if let data = try? JSONSerialization.data(withJSONObject: dict) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// 校验一批输入的总页数是否超出当前层级配额。
+    /// 返回 nil 表示放行；返回字符串表示拦截原因。
+    static func checkQuota(totalPages: Int, tier: LicenseTier = currentTier()) -> String? {
+        switch tier {
+        case .free, .trial:
+            if totalPages > freeTierPageLimit {
+                return "免费版单批最多处理 \(freeTierPageLimit) 页，本次为 \(totalPages) 页。"
+                    + "升级 Pro 可解除限制。"
+            }
+            return nil
+        case .pro, .proExpired:
+            return nil
+        case .expired:
+            return "授权已过期，请续订后继续使用。"
+        }
+    }
+
+    /// 面向用户的层级说明。
+    static func describe(_ tier: LicenseTier) -> String {
+        switch tier {
+        case .free: return "免费版（单批 ≤ \(freeTierPageLimit) 页）"
+        case .trial: return "试用版"
+        case .pro: return "Pro"
+        case .proExpired(let until):
+            let days = max(0, Int(until.timeIntervalSinceNow / 86400))
+            return "Pro（已过期，宽限期剩余 \(days) 天）"
+        case .expired: return "已过期"
+        }
+    }
+}
+
 // MARK: - CLI 模式（供脚本化验证与命令行使用）
 
 /// 版本号：与 resources/Info.plist 的 CFBundleShortVersionString 保持一致。
@@ -347,6 +470,23 @@ func runCLI(_ args: [String]) -> Int32 {
 
     if let reason = Engine.unavailableReason() {
         fputs("\(reason)\n", stderr); return 2
+    }
+
+    // 授权与配额：GUI 与 CLI 共用同一判定，避免两处行为不一致。
+    LicenseGate.recordFirstSeenIfNeeded()
+    let tier = LicenseGate.currentTier()
+    if !tier.isUsable {
+        fputs("\(LicenseGate.describe(tier))：\(LicenseGate.checkQuota(totalPages: 0, tier: tier) ?? "")\n", stderr)
+        return 2
+    }
+    var totalPages = 0
+    for f in files {
+        totalPages += PDFCheck.info(f).pages
+    }
+    if let reason = LicenseGate.checkQuota(totalPages: totalPages, tier: tier) {
+        fputs("\(reason)\n", stderr)
+        fputs("当前层级：\(LicenseGate.describe(tier))\n", stderr)
+        return 2
     }
     if let dir = s.outputDir {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -768,6 +908,17 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         guard !isRunning, !items.isEmpty else { NSSound.beep(); return }
         if let reason = Engine.unavailableReason() { alert(reason); return }
         collectSettings()
+
+        // 授权与配额：与 CLI 走同一判定。
+        LicenseGate.recordFirstSeenIfNeeded()
+        let tier = LicenseGate.currentTier()
+        if !tier.isUsable {
+            alert("\(LicenseGate.describe(tier))，请续订后继续使用。"); return
+        }
+        let totalPages = items.reduce(0) { $0 + $1.pages }
+        if let reason = LicenseGate.checkQuota(totalPages: totalPages, tier: tier) {
+            alert(reason); return
+        }
         if let dir = settings.outputDir {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }

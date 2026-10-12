@@ -86,6 +86,24 @@ stderr：处理进度 `→ <文件名>`，末尾汇总 `batchocr：X 成功，Y 
 | S-34 | 队列为空时显示拖拽提示浮层，有文件后隐藏 | 人工 |
 | S-35 | 复杂控件具备悬停提示（toolTip） | 人工（AX help 核验） |
 
+## 6. 授权与配额
+
+> 复刻自 ABBYY FineReader PDF 的试用配额机制（FRSerialGuard 的 FRLimit）
+> 与 Nitro PDF Pro 的宽限期设计（RevenueCat 的 gracePeriodExpiresAt）。
+> 逆向依据见 reverse/FINDINGS.md。
+
+| 编号 | 契约 | 验证 |
+| --- | --- | --- |
+| S-40 | 免费版/试用版单批总页数超过 freeTierPageLimit（50）时拒绝处理，退出码 2；GUI 弹提示且不入列 | H1 |
+| S-41 | Pro 层级无页数配额限制；状态文件缺失或损坏时保守放行，不阻断正常使用 | H2 |
+| S-42 | Pro 过期但在宽限期（proGracePeriodDays = 7 天）内仍可正常处理 | H3 |
+| S-43 | Pro 过期且宽限期已过则退出码 2，提示续订 | H4 |
+| S-44 | 系统时间早于首次记录时间（时钟回拨）时按免费版处理，不得借此突破配额 | H5 |
+| S-45 | 授权判定由 GUI 与 CLI 共用同一实现（LicenseGate），两处行为一致 | H1...H6 |
+
+状态文件：~/Library/Application Support/BatchOCR/license.json，字段 tier（free/trial/pro）、
+expiresAt（Unix 秒）、firstSeenAt（Unix 秒，用于时钟回拨检测）。
+
 ## 6. 依赖
 
 - `ocrmypdf`（含 `tesseract`/`ghostscript`/`qpdf`），经 Homebrew：`brew install ocrmypdf`

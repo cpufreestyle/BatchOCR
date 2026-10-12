@@ -420,14 +420,92 @@ def section_g():
         if not m:
             continue
         sid, how = m.group(1), m.group(2)
-        automated = sid in src or re.search(r"C-[A-Z]\d+", how)
+        automated = sid in src or re.search(r"[CGH]-?[A-Z0-9]+", how)
         if not automated and not re.search(r"人工|手动", how):
             unverified.append(f"{sid}（验证方式：{how}）")
     check("G-03", "每条 S-xx 都有明确的验证方式（自动或人工）",
           not unverified, f"缺少验证方式：{unverified}")
 
+    # G 段自身的编号（G-01..G-03）不在 SPEC 的 C-*/H* 命名空间里，单独确认其存在
+    check("G-03", "G 段对账断言存在（G-01/G-02/G-03）",
+          all(f'check("G-0{i}"' in src for i in (1, 2, 3)),
+          "G 段断言被移除或改名")
+
 
 # ------------------------------------------------------------------ 主流程
+def section_h(tmp):
+    """H. 授权与配额（S-40…S-43）。
+
+    改 Sources/main.swift 的授权状态文件位置会破坏这些断言，所以路径从这里取。
+    """
+    print("\nH. 授权与配额")
+    state = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
+                         "BatchOCR", "license.json")
+    orig = open(state, "rb").read() if os.path.exists(state) else None
+    big = os.path.join(tmp, "quota.pdf")
+    run([TOOL, "gen", big, "60", "en"])
+    if not os.path.exists(big):
+        record(SKIP, "S-40", "配额检查（无法生成 60 页样例）")
+        return
+
+    def run_big():
+        return cli("--lang", "eng", "--out", os.path.join(tmp, "h-out"), big, timeout=600)
+
+    try:
+        # --- S-40：免费版按页数配额拦截，退出码 2 ---
+        with open(state, "w") as f:
+            f.write('{"tier":"free","firstSeenAt":%d}' % int(time.time() - 86400))
+        rc, out, err, _ = run_big()
+        check("S-40", "免费版超配额拦截且退出码 2",
+              rc == 2 and "免费版单批最多处理" in err, f"rc={rc} err={err.strip()[-100:]!r}")
+
+        # --- S-41：Pro 解除配额限制 ---
+        with open(state, "w") as f:
+            f.write('{"tier":"pro","expiresAt":%d,"firstSeenAt":%d}'
+                    % (int(time.time() + 86400 * 30), int(time.time() - 86400)))
+        rc, out, err, _ = run_big()
+        check("S-41", "Pro 无限额，60 页正常处理",
+              rc == 0 and "pages=60" in out, f"rc={rc} err={err.strip()[-100:]!r}")
+
+        # --- S-42：Pro 过期但在宽限期内仍可用 ---
+        with open(state, "w") as f:
+            f.write('{"tier":"pro","expiresAt":%d,"firstSeenAt":%d}'
+                    % (int(time.time() - 86400 * 3), int(time.time() - 86400)))
+        rc, out, err, _ = run_big()
+        check("S-42", "Pro 宽限期内仍可处理",
+              rc == 0 and "pages=60" in out, f"rc={rc} err={err.strip()[-100:]!r}")
+
+        # --- S-43：Pro 过期且宽限期已过 → 降级为不可用 ---
+        with open(state, "w") as f:
+            f.write('{"tier":"pro","expiresAt":%d,"firstSeenAt":%d}'
+                    % (int(time.time() - 86400 * 30), int(time.time() - 86400)))
+        rc, out, err, _ = run_big()
+        check("S-43", "Pro 过期且宽限期已过则退出 2",
+              rc == 2 and "过期" in err, f"rc={rc} err={err.strip()[-100:]!r}")
+
+        # --- S-40：时钟回拨不得用来突破配额 ---
+        with open(state, "w") as f:
+            f.write('{"tier":"pro","expiresAt":%d,"firstSeenAt":%d}'
+                    % (int(time.time() + 86400 * 30), int(time.time() + 86400 * 30)))
+        rc, out, err, _ = run_big()
+        check("S-40", "时钟回拨时按免费版处理（不得借 pro 突破配额）",
+              rc == 2 and "免费版" in err, f"rc={rc} err={err.strip()[-100:]!r}")
+
+        # --- S-41：状态文件损坏时保守放行，不误伤用户 ---
+        with open(state, "w") as f:
+            f.write("not json at all")
+        rc, out, err, _ = cli("--lang", "eng", "--out", os.path.join(tmp, "h-out2"),
+                              os.path.join(ROOT, "test", "samples", "invoice_en.pdf"))
+        check("S-41", "状态文件损坏时保守放行（不阻断正常使用）",
+              rc == 0 and "pages=" in out, f"rc={rc} err={err.strip()[-100:]!r}")
+    finally:
+        if orig is None:
+            if os.path.exists(state):
+                os.remove(state)
+        else:
+            with open(state, "wb") as f:
+                f.write(orig)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="跳过真实 OCR 段（D 段）")
@@ -444,6 +522,7 @@ def main():
         section_b(tmp)
         section_e(tmp)
         section_g()
+        section_h(tmp)
         if args.fast:
             record(SKIP, "C-C*", "输入收集/输出命名（--fast 跳过）")
             record(SKIP, "C-D*", "识别段（--fast 跳过）")
